@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>极简剪切工作台</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">CUT</span><strong>剪切工作台</strong></div>
+    <label class="path-field source-field"><span>源目录</span><input id="sourceRoot" value="/home/ubuntu/data/capture" spellcheck="false"></label>
+    <label class="path-field"><span>cleaned 根目录</span><input id="outputRoot" placeholder="/home/ubuntu/data/cleaned_capture" spellcheck="false"></label>
+    <label class="operator-field"><span>操作人员</span><input id="operator" placeholder="姓名"></label>
+    <button id="openRoot" class="primary">打开</button>
+    <button id="refresh" class="icon-button" title="手动刷新" aria-label="手动刷新">↻</button>
+    <button id="queueToggle" class="queue-button" title="任务队列" aria-label="任务队列"><span aria-hidden="true">☷</span><span id="queueCount" class="queue-count" hidden>0</span></button>
+  </header>
+  <nav id="breadcrumbs" class="breadcrumbs" aria-label="目录导航"></nav>
+
+  <main class="workspace">
+    <aside class="browser-pane">
+      <div class="pane-head">
+        <div><span class="eyebrow">当前目录</span><strong id="browserTitle">尚未打开</strong></div>
+        <span id="itemCount" class="count">0</span>
+      </div>
+      <div id="browserEmpty" class="empty">输入源目录并打开</div>
+      <div id="folderList" class="folder-list" hidden></div>
+      <div id="episodeViewport" class="episode-viewport" hidden><div id="episodeCanvas"></div></div>
+    </aside>
+
+    <section class="editor-pane">
+      <div id="welcome" class="welcome">
+        <span class="welcome-mark">CUT</span>
+        <h1>选择一个 Episode</h1>
+      </div>
+      <div id="editor" hidden>
+        <div class="editor-head">
+          <div><span class="eyebrow">EPISODE</span><h1 id="episodeName"></h1><p id="taskName"></p></div>
+          <button id="validationBadge" class="validation-badge" type="button"></button>
+        </div>
+
+        <div id="streamTabs" class="stream-tabs" role="tablist"></div>
+        <div class="video-stage">
+          <video id="video" preload="metadata" playsinline></video>
+          <div id="videoUnavailable" class="video-unavailable" hidden></div>
+          <div class="frame-overlay"><span id="overlayFrame">0</span><span>/</span><span id="overlayTotal">0</span></div>
+        </div>
+
+        <div class="transport">
+          <button id="toStart" class="icon-button" title="首帧" aria-label="首帧">|‹</button>
+          <button id="stepBack" class="icon-button" title="上一帧" aria-label="上一帧">‹</button>
+          <button id="playPause" class="play-button" title="播放或暂停" aria-label="播放或暂停">▶</button>
+          <button id="stepForward" class="icon-button" title="下一帧" aria-label="下一帧">›</button>
+          <button id="toEnd" class="icon-button" title="末帧" aria-label="末帧">›|</button>
+          <input id="scrubber" type="range" min="0" max="1" value="0" aria-label="当前帧">
+          <label class="frame-input"><span>帧</span><input id="frameNumber" type="number" min="0" value="0"></label>
+          <span id="timecode" class="timecode">00:00.000</span>
+        </div>
+
+        <div class="range-section">
+          <div class="section-head">
+            <div><span class="eyebrow">删除区间</span><strong><span id="removedCount">0</span> 帧</strong></div>
+            <div class="compact-actions">
+              <button id="preview" class="secondary">预览结果</button>
+              <button id="undo" class="icon-button" title="撤销" aria-label="撤销">↶</button>
+              <button id="clear" class="icon-button" title="清空区间" aria-label="清空区间">×</button>
+            </div>
+          </div>
+          <div id="rangeTrack" class="range-track" tabindex="0" aria-label="拖拽选择删除区间"><div class="track-line"></div></div>
+          <div id="rangeList" class="range-list"></div>
+        </div>
+
+        <div class="submit-bar">
+          <div><strong id="resultFrames">保留 0 帧</strong><span id="resultDuration">0 秒</span></div>
+          <div class="submit-actions">
+            <button id="noTrim" class="secondary">无需剪切</button>
+            <button id="trim" class="primary">生成剪切数据</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <aside id="queuePanel" class="queue-panel" hidden aria-label="任务队列">
+    <div class="queue-head">
+      <div><span class="eyebrow">内存队列</span><h2>任务队列</h2></div>
+      <button id="queueClose" class="icon-button" title="关闭队列" aria-label="关闭队列">×</button>
+    </div>
+    <label class="concurrency-field"><span>并发任务</span><select id="concurrency" aria-label="并发任务数"><option>1</option><option selected>2</option><option>3</option><option>4</option></select><small>推荐 2</small></label>
+    <div id="queueSummary" class="queue-summary">无活动任务</div>
+    <div id="queueList" class="queue-list"></div>
+    <span id="operationStatus" class="visually-hidden"></span>
+  </aside>
+
+  <dialog id="overwriteDialog">
+    <form method="dialog">
+      <span class="eyebrow">目标冲突</span><h2>覆盖现有 Episode？</h2>
+      <p id="overwritePath"></p>
+      <div class="dialog-actions"><button value="cancel" class="secondary">取消</button><button id="confirmOverwrite" value="confirm" class="danger">确认覆盖</button></div>
+    </form>
+  </dialog>
+  <dialog id="issuesDialog">
+    <form method="dialog">
+      <span class="eyebrow">校验详情</span><h2>Episode 校验</h2>
+      <pre id="issues"></pre>
+      <div class="dialog-actions"><button value="close" class="secondary">关闭</button></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" hidden></div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>
