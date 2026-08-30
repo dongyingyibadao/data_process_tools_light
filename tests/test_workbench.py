@@ -215,6 +215,11 @@ def test_cpu_budget_and_static_no_polling() -> None:
     script = Path(__file__).parents[1] / "lightworkbench/static/app.js"
     content = script.read_text(encoding="utf-8")
     assert "setInterval" not in content
+    assert content.count("new EventSource(") == 1
+    assert 'new EventSource("/api/operations/events")' in content
+    assert "eventSources" not in content
+    assert "new AbortController()" in content
+    assert "{signal: controller.signal}" in content
     assert "Math.min(26" in content
     page = client.get("/")
     assert page.status_code == 200

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import time
@@ -25,8 +26,10 @@ def test_complete_browser_workflow_and_idle_network(tmp_path: Path) -> None:
     cleaned = tmp_path / "cleaned"
     relative = "289/2026-08-30/task/episode_000001"
     make_episode(raw, relative, frames=120, fps=30)
+    second_relative = "289/2026-08-30/task/episode_000002"
+    make_episode(raw, second_relative, frames=24, fps=8)
     task = raw / "289/2026-08-30/task"
-    for index in range(2, 130):
+    for index in range(3, 130):
         (task / f"episode_{index:06d}" / "videos").mkdir(parents=True)
 
     port = free_port()
@@ -52,6 +55,38 @@ def test_complete_browser_workflow_and_idle_network(tmp_path: Path) -> None:
             api_requests: list[str] = []
             page.on("request", lambda request: api_requests.append(request.url) if "/api/" in request.url else None)
             page.goto(f"http://127.0.0.1:{port}")
+            page.wait_for_timeout(300)
+            for _ in range(10):
+                page.evaluate("followOperations()")
+            page.locator("#queueToggle").click()
+            page.locator("#queueClose").click()
+            page.locator("#queueToggle").click()
+            page.locator("#queueClose").click()
+            event_requests = [url for url in api_requests if url.endswith("/api/operations/events")]
+            assert len(event_requests) == 1
+            assert not [url for url in api_requests if "/api/operations/" in url and url.endswith("/events") and not url.endswith("/operations/events")]
+
+            transition = page.evaluate("""(() => {
+                state.operationsInitialized = true;
+                state.operations = new Map();
+                state.notifiedTerminal.clear();
+                const active = Array.from({length: 10}, (_, index) => ({
+                    id: "test-" + index, status: "queued", progress: 0, message: "queued",
+                    queuePosition: index + 1, episode: "task/episode_" + index,
+                    mode: "no_trim", submittedAt: String(index),
+                }));
+                applyOperationsSnapshot({queued: active, running: [], completed: []});
+                const completed = active.map((item) => ({...item, status: "completed", progress: 1,
+                    result: {outputPath: "/tmp/" + item.id}}));
+                applyOperationsSnapshot({queued: [], running: [], completed});
+                const firstCount = state.notifiedTerminal.size;
+                applyOperationsSnapshot({queued: [], running: [], completed});
+                const secondCount = state.notifiedTerminal.size;
+                applyOperationsSnapshot({queued: [], running: [], completed: []});
+                return {firstCount, secondCount};
+            })()""")
+            assert transition == {"firstCount": 10, "secondCount": 10}
+
             page.locator("#sourceRoot").fill(str(raw))
             page.locator("#outputRoot").fill(str(cleaned))
             page.locator("#operator").fill("browser-tester")
@@ -65,6 +100,64 @@ def test_complete_browser_workflow_and_idle_network(tmp_path: Path) -> None:
             expect(page.locator("#validationBadge")).to_have_text("3 路同步有效")
             expect(page.locator("#video")).to_have_count(1)
 
+            rapid_switch = page.evaluate("""async () => {
+                const originalFetch = window.fetch;
+                let aborted = false;
+                window.fetch = (url, options = {}) => {
+                    if (!String(url).includes("episode_000001")) return originalFetch(url, options);
+                    return new Promise((resolve, reject) => {
+                        const timer = setTimeout(() => originalFetch(url, options).then(resolve, reject), 500);
+                        options.signal.addEventListener("abort", () => {
+                            clearTimeout(timer);
+                            aborted = true;
+                            reject(new DOMException("Aborted", "AbortError"));
+                        }, {once: true});
+                    });
+                };
+                await Promise.all([
+                    openEpisode("289/2026-08-30/task/episode_000001"),
+                    openEpisode("289/2026-08-30/task/episode_000002"),
+                ]);
+                window.fetch = originalFetch;
+                return {aborted, episode: state.detail && state.detail.episode};
+            }""")
+            assert rapid_switch == {"aborted": True, "episode": second_relative}
+            expect(page.locator("#episodeName")).to_have_text("episode_000002")
+            page.evaluate("openEpisode('289/2026-08-30/task/episode_000001')")
+            expect(page.locator("#episodeName")).to_have_text("episode_000001")
+            expect(page.locator("#validationBadge")).to_have_text("3 路同步有效")
+
+            queue_regression = page.evaluate("""async ({queueOutput, mainOutput}) => {
+                await api("/api/operations/settings", {
+                    method: "PATCH", headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({concurrency: 1}),
+                });
+                const validToken = state.detail.sourceToken;
+                outputRoot.value = queueOutput;
+                for (let index = 0; index < 10; index += 1) {
+                    state.episode = index === 0
+                        ? "289/2026-08-30/task/episode_000001"
+                        : "289/2026-08-30/task/episode_" + String(index + 2).padStart(6, "0");
+                    state.detail = {sourceToken: index === 0 ? validToken : "invalid-token"};
+                    state.ranges = index === 0 ? [[0, 60]] : [];
+                    await submit(index === 0 ? "trim" : "no_trim");
+                }
+                const started = performance.now();
+                await openEpisode("289/2026-08-30/task/episode_000002");
+                const elapsed = performance.now() - started;
+                outputRoot.value = mainOutput;
+                return {elapsed, episode: state.detail && state.detail.episode};
+            }""", {"queueOutput": str(cleaned / "queue-regression"), "mainOutput": str(cleaned)})
+            assert queue_regression["elapsed"] < 2_000
+            assert queue_regression["episode"] == second_relative
+            event_requests = [url for url in api_requests if url.endswith("/api/operations/events")]
+            assert len(event_requests) == 1
+            assert not [url for url in api_requests if "/api/operations/" in url and url.endswith("/events") and not url.endswith("/operations/events")]
+            expect(page.locator("#validationBadge")).to_have_text("3 路同步有效")
+            expect(page.locator("#video")).to_have_attribute("src", re.compile("episode_000002"))
+
+            page.evaluate("openEpisode('289/2026-08-30/task/episode_000001')")
+            expect(page.locator("#validationBadge")).to_have_text("3 路同步有效")
             page.get_by_role("button", name="rgbd_head_color", exact=True).click()
             expect(page.locator("button.stream-tab.active")).to_have_text("rgbd_head_color")
             track = page.locator("#rangeTrack")

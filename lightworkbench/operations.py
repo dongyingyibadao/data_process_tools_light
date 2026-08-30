@@ -35,6 +35,9 @@ CSV_FIELDS = [
     "operator", "mode", "removed_ranges", "source_frames", "output_frames",
     "source_token", "output_fingerprint", "output_path", "completed_at_utc",
 ]
+FINGERPRINT_VERSION = "sha256-relative-path-size-mtime-ns-v1"
+FINGERPRINT_EXCLUDES = ("CUT_INFO.json",)
+TIMESTAMP_REWRITE_VERSION = 2
 
 
 class QueueFullError(WorkbenchError):
@@ -113,31 +116,122 @@ def trim_video(source: Path, destination: Path, spans: list[tuple[int, int]], fp
         raise WorkbenchError(f"FFmpeg 剪切失败: {stream_name}") from exc
 
 
+def _finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _kept_span_shifts(source: Path, keep: set[int], fps: float) -> tuple[dict[int, float], float | None]:
+    wall_times: list[float | None] = []
+    with source.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if isinstance(row.get("_type"), str):
+                continue
+            wall = row.get("t_wall")
+            wall_times.append(float(wall) if _finite_number(wall) else None)
+
+    kept_indices = sorted(index for index in keep if 0 <= index < len(wall_times))
+    if not kept_indices:
+        return {}, None
+    spans: list[tuple[int, int]] = []
+    start = previous = kept_indices[0]
+    for index in kept_indices[1:]:
+        if index != previous + 1:
+            spans.append((start, previous + 1))
+            start = index
+        previous = index
+    spans.append((start, previous + 1))
+
+    def elapsed(start_index: int, end_index: int) -> float:
+        start_wall, end_wall = wall_times[start_index], wall_times[end_index]
+        if start_wall is not None and end_wall is not None:
+            duration = end_wall - start_wall
+            if math.isfinite(duration) and duration >= 0:
+                return duration
+        return (end_index - start_index) / fps
+
+    shifts: dict[int, float] = {}
+    cumulative_shift = elapsed(0, spans[0][0])
+    for span_index, (start, end) in enumerate(spans):
+        if span_index:
+            previous_end = spans[span_index - 1][1]
+            cumulative_shift += elapsed(previous_end, start)
+        for frame_index in range(start, end):
+            shifts[frame_index] = cumulative_shift
+
+    first_wall = wall_times[spans[0][0]]
+    first_output_wall = first_wall - shifts[spans[0][0]] if first_wall is not None else None
+    return shifts, first_output_wall
+
+
+def _shift_record_times(row: dict[str, Any], shift_seconds: float,
+                        first_output_wall: float | None) -> dict[str, Any]:
+    def transform(value: Any, key: str | None = None, parent: str | None = None) -> Any:
+        if isinstance(value, dict):
+            return {child_key: transform(child, child_key, key) for child_key, child in value.items()}
+        if isinstance(value, list):
+            return [transform(child, key, parent) for child in value]
+        if not _finite_number(value) or key is None or key.endswith("_age_ms"):
+            return value
+        if key == "t_ns":
+            return int(value) - int(round(shift_seconds * 1_000_000_000))
+        if key == "ts" and parent == "control":
+            return float(value) - shift_seconds * 1000.0
+        if key in {"t_wall", "t_monotonic", "t_intended", "session_start_t", "timestamp", "stamp"} or key.endswith("_t"):
+            if float(value) == 0.0 and (key.endswith("_t") or key in {"timestamp", "stamp"}):
+                return value
+            return float(value) - shift_seconds
+        return value
+
+    transformed = transform(row)
+    if first_output_wall is not None:
+        transformed["session_start_t"] = first_output_wall
+    monotonic = transformed.get("t_monotonic")
+    intended = transformed.get("t_intended")
+    if _finite_number(monotonic) and _finite_number(intended):
+        transformed["t_jitter_ms"] = (float(monotonic) - float(intended)) * 1000.0
+    output_wall = transformed.get("t_wall")
+    topics = transformed.get("topics_t")
+    if _finite_number(output_wall) and isinstance(topics, dict):
+        for key in list(topics):
+            if not key.endswith("_age_ms"):
+                continue
+            timestamp = topics.get(f"{key[:-7]}_t")
+            if _finite_number(timestamp):
+                topics[key] = (float(output_wall) - float(timestamp)) * 1000.0
+    return transformed
+
+
 def rewrite_manifest(source: Path, destination: Path, keep: set[int], fps: float,
                      audit: dict[str, Any]) -> int:
     source_index = 0
     output_index = 0
-    first_times: dict[str, float | int] = {}
+    shifts, first_output_wall = _kept_span_shifts(source, keep, fps)
+    first_shift = shifts[min(shifts)] if shifts else 0.0
+    last_shift = shifts[max(shifts)] if shifts else first_shift
     with source.open("r", encoding="utf-8") as src, destination.open("w", encoding="utf-8") as dst:
         for line in src:
             if not line.strip():
                 continue
             row = json.loads(line)
             if isinstance(row.get("_type"), str):
+                row = _shift_record_times(
+                    row,
+                    first_shift if row.get("_type") == "session_header" else last_shift,
+                    first_output_wall,
+                )
                 if row.get("_type") == "session_header":
+                    if first_output_wall is not None:
+                        row["t_wall"] = first_output_wall
                     row["lightworkbench"] = audit
                 json.dump(row, dst, ensure_ascii=False, separators=(",", ":"))
                 dst.write("\n")
                 continue
             if source_index in keep:
-                if not first_times:
-                    for key in ("t_wall", "t_ns", "t_monotonic", "t_intended"):
-                        if isinstance(row.get(key), (int, float)) and not isinstance(row.get(key), bool):
-                            first_times[key] = row[key]
+                row = _shift_record_times(row, shifts.get(source_index, 0.0), first_output_wall)
                 row["frame_idx"] = output_index
-                for key, base in first_times.items():
-                    step = output_index / fps
-                    row[key] = int(base + step * 1_000_000_000) if key == "t_ns" else float(base) + step
                 videos = row.get("videos")
                 if isinstance(videos, dict):
                     for entry in videos.values():
@@ -154,12 +248,14 @@ def rewrite_manifest(source: Path, destination: Path, keep: set[int], fps: float
 
 def output_fingerprint(path: Path) -> str:
     digest = __import__("hashlib").sha256()
-    for item in sorted(candidate for candidate in path.rglob("*") if candidate.is_file()):
+    for item in sorted(
+        candidate for candidate in path.rglob("*")
+        if candidate.is_file() and candidate.relative_to(path).as_posix() not in FINGERPRINT_EXCLUDES
+    ):
         stat = item.stat()
         digest.update(item.relative_to(path).as_posix().encode())
         digest.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
     return digest.hexdigest()
-
 
 @dataclass
 class OperationState:
@@ -217,6 +313,7 @@ class OperationManager:
         self._terminal: deque[str] = deque()
         self._concurrency = self.DEFAULT_CONCURRENCY
         self._condition = threading.Condition(threading.RLock())
+        self._snapshot_version = 0
         self._csv_lock = threading.Lock()
         self._dispatcher_thread = threading.Thread(
             target=self._dispatcher, daemon=True, name="operation-dispatcher"
@@ -249,7 +346,7 @@ class OperationManager:
             self._condition.notify_all()
         return self.settings()
 
-    def list_operations(self) -> dict[str, list[dict[str, Any]]]:
+    def snapshot(self) -> tuple[int, dict[str, list[dict[str, Any]]]]:
         with self._condition:
             queued = [self._states[item].event() for item in self._queue]
             running = sorted(
@@ -261,17 +358,26 @@ class OperationManager:
                 for item in reversed(self._terminal)
                 if item in self._states
             ]
-        return {"queued": queued, "running": running, "completed": completed}
+            return self._snapshot_version, {
+                "queued": queued,
+                "running": running,
+                "completed": completed,
+            }
 
-    @staticmethod
-    def _update(state: OperationState, progress: float, message: str, **changes: Any) -> None:
-        with state.condition:
-            state.progress = progress
-            state.message = message
-            for key, value in changes.items():
-                setattr(state, key, value)
-            state.version += 1
-            state.condition.notify_all()
+    def list_operations(self) -> dict[str, list[dict[str, Any]]]:
+        return self.snapshot()[1]
+
+    def _update(self, state: OperationState, progress: float, message: str, **changes: Any) -> None:
+        with self._condition:
+            with state.condition:
+                state.progress = progress
+                state.message = message
+                for key, value in changes.items():
+                    setattr(state, key, value)
+                state.version += 1
+                state.condition.notify_all()
+            self._snapshot_version += 1
+            self._condition.notify_all()
 
     def _refresh_queue_positions_locked(self) -> None:
         for position, operation_id in enumerate(self._queue, 1):
@@ -368,6 +474,7 @@ class OperationManager:
             self._states[state.id] = state
             self._queue.append(state.id)
             self._active_targets.add(target_key)
+            self._snapshot_version += 1
             self._condition.notify_all()
         return state
 
@@ -385,6 +492,7 @@ class OperationManager:
                     self._states.pop(expired, None)
                 self._terminal.append(state.id)
                 self._refresh_queue_positions_locked()
+                self._snapshot_version += 1
                 self._condition.notify_all()
 
     def _run(self, state: OperationState, request: dict[str, Any]) -> None:
@@ -438,6 +546,9 @@ class OperationManager:
             "mode": mode, "sourceRoot": str(root), "episode": relative, "operator": operator,
             "removedRanges": [list(item) for item in removed], "sourceFrames": detail["frameCount"],
             "outputFrames": output_frames, "sourceToken": expected, "completedAtUtc": None,
+            "fingerprintVersion": FINGERPRINT_VERSION,
+            "fingerprintExcludes": list(FINGERPRINT_EXCLUDES),
+            "timestampRewriteVersion": TIMESTAMP_REWRITE_VERSION,
         }
         try:
             if mode == "no_trim":

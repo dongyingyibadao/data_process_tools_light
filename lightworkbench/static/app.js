@@ -5,7 +5,8 @@ const state = {
   root: "", path: "", listing: null, episode: "", detail: null, stream: null,
   ranges: [], history: [], frame: 0, preview: false, dragStart: null, dragEnd: null,
   nextKeptFrame: null, requestSerial: 0, operationId: null, pendingMode: null,
-  operations: new Map(), eventSources: new Map(),
+  operations: new Map(), operationsInitialized: false, operationEvents: null,
+  notifiedTerminal: new Set(), episodeController: null,
 };
 const rowHeight = 48;
 
@@ -153,6 +154,9 @@ window.addEventListener("resize", renderVirtualRows);
 
 async function openEpisode(relative) {
   const serial = ++state.requestSerial;
+  if (state.episodeController) state.episodeController.abort();
+  const controller = new AbortController();
+  state.episodeController = controller;
   const video = $("#video");
   video.pause();
   video.removeAttribute("src");
@@ -183,7 +187,10 @@ async function openEpisode(relative) {
   $("#preview").textContent = "预览结果";
 
   try {
-    const detail = await api(`/api/episodes/${episodeUrl(relative)}?root=${encodeURIComponent(state.root)}`);
+    const detail = await api(
+      `/api/episodes/${episodeUrl(relative)}?root=${encodeURIComponent(state.root)}`,
+      {signal: controller.signal},
+    );
     if (serial !== state.requestSerial) return;
     state.detail = detail;
     const saved = localStorage.getItem("light.camera");
@@ -193,6 +200,7 @@ async function openEpisode(relative) {
       || playable[0] || null;
     renderEditor();
   } catch (error) {
+    if (error.name === "AbortError") return;
     if (serial !== state.requestSerial) return;
     const badge = $("#validationBadge");
     badge.className = "validation-badge invalid";
@@ -200,6 +208,8 @@ async function openEpisode(relative) {
     badge.disabled = false;
     $("#issues").textContent = error.message;
     toast(error.message);
+  } finally {
+    if (state.episodeController === controller) state.episodeController = null;
   }
 }
 
@@ -490,9 +500,8 @@ async function submit(mode, overwrite = false) {
   try {
     const result = await api("/api/operations", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
     state.operationId = result.operationId;
-    state.operations.set(result.operationId, result);
+    if (!state.operations.has(result.operationId)) state.operations.set(result.operationId, result);
     renderQueue();
-    followOperation(result.operationId, result.eventsUrl);
     toast(`任务已进入队列，第 ${result.queuePosition || 1} 位`);
   } catch (error) {
     if (error.status === 409 && error.message.includes("目标已存在")) {
@@ -587,28 +596,37 @@ function renderQueue() {
   });
 }
 
-function followOperation(id, url = `/api/operations/${id}/events`) {
-  if (state.eventSources.has(id)) return;
-  const source = new EventSource(url);
-  state.eventSources.set(id, source);
-  source.addEventListener("progress", (event) => {
-    const data = JSON.parse(event.data);
-    state.operations.set(id, data);
-    $("#operationStatus").textContent = data.status;
-    renderQueue();
-    if (terminalStatuses.has(data.status)) {
-      source.close();
-      state.eventSources.delete(id);
-      if (data.status === "completed") toast(`输出完成：${data.result.outputPath}`);
-      else if (data.status === "completed_csv_failed") toast("输出已发布，但 CSV 记录失败");
-      else toast(data.error || "操作失败");
-    }
-  });
-  source.onerror = () => {
-    source.close();
-    state.eventSources.delete(id);
-    toast("任务进度连接已断开，打开队列可重新读取状态");
-  };
+function applyOperationsSnapshot(data) {
+  const previous = state.operations;
+  const next = new Map();
+  [...data.queued, ...data.running, ...data.completed].forEach((item) => next.set(item.id, item));
+  if (!state.operationsInitialized) {
+    next.forEach((item) => {
+      if (terminalStatuses.has(item.status)) state.notifiedTerminal.add(item.id);
+    });
+    state.operationsInitialized = true;
+  } else {
+    next.forEach((item, id) => {
+      const old = previous.get(id);
+      const wasActive = old && (old.status === "queued" || old.status === "running");
+      if (!wasActive || !terminalStatuses.has(item.status) || state.notifiedTerminal.has(id)) return;
+      state.notifiedTerminal.add(id);
+      if (item.status === "completed") toast(`输出完成：${item.result.outputPath}`);
+      else if (item.status === "completed_csv_failed") toast("输出已发布，但 CSV 记录失败");
+      else toast(item.error || "操作失败");
+    });
+  }
+  state.operations = next;
+  const current = state.operationId && next.get(state.operationId);
+  if (current) $("#operationStatus").textContent = current.status;
+  renderQueue();
+}
+
+function followOperations() {
+  if (state.operationEvents) return;
+  const source = new EventSource("/api/operations/events");
+  state.operationEvents = source;
+  source.addEventListener("snapshot", (event) => applyOperationsSnapshot(JSON.parse(event.data)));
 }
 
 async function retryCsv(id) {
@@ -625,10 +643,7 @@ async function retryCsv(id) {
 async function loadOperations() {
   try {
     const data = await api("/api/operations");
-    state.operations.clear();
-    [...data.queued, ...data.running, ...data.completed].forEach((item) => state.operations.set(item.id, item));
-    renderQueue();
-    [...data.queued, ...data.running].forEach((item) => followOperation(item.id));
+    applyOperationsSnapshot(data);
   } catch (error) {
     toast(error.message);
   }
@@ -679,6 +694,8 @@ $("#refresh").addEventListener("click", () => browse(state.path || "", true));
 sourceRoot.addEventListener("keydown", (event) => { if (event.key === "Enter") browse(""); });
 
 function closeEditor() {
+  if (state.episodeController) state.episodeController.abort();
+  state.episodeController = null;
   const video = $("#video");
   video.pause();
   video.removeAttribute("src");
@@ -697,3 +714,4 @@ function closeEditor() {
 
 loadSettings();
 loadOperations();
+followOperations();
