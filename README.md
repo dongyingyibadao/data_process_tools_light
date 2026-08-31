@@ -5,8 +5,9 @@
 ## 启动
 
 ```bash
-cd 2026_cz/data_autopro_tools_light
-./start.sh
+source /home/ubuntu/miniconda3/bin/activate
+conda activate data_process
+/home/ubuntu/workspace/junxi/data_process_tools_light/start.sh
 ```
 
 默认地址为 `http://127.0.0.1:8332`。可通过 `HOST` 和 `PORT` 修改监听地址。页面中的 cleaned 输出根目录必须与源根目录完全分离；原始数据永不修改。
