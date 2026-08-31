@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -10,7 +11,7 @@ import pytest
 
 from fastapi.testclient import TestClient
 
-from lightworkbench.app import app, operation_manager
+from lightworkbench.app import app, operation_manager, operation_snapshot_events
 from lightworkbench.config import RESOURCES
 from lightworkbench.core import BrowseService, ConflictError, EpisodeService, WorkbenchError
 from lightworkbench.operations import OperationManager, QueueFullError
@@ -18,6 +19,19 @@ from test_workbench import detail, make_episode, submit, wait_operation
 
 
 client = TestClient(app)
+
+
+class DisconnectRequest:
+    def __init__(self) -> None:
+        self.disconnected = False
+
+    async def is_disconnected(self) -> bool:
+        return self.disconnected
+
+
+def parse_snapshot(event: str) -> dict:
+    assert event.startswith("event: snapshot\n")
+    return json.loads(event.split("data: ", 1)[1])
 
 
 def test_129_episode_browse_is_bounded_and_fast(tmp_path: Path) -> None:
@@ -162,3 +176,84 @@ def test_queue_capacity_duplicate_target_settings_and_slot_budget(tmp_path: Path
         raise AssertionError("queued operations did not drain")
     assert allocations
     assert all(1 <= value <= int(RESOURCES["ffmpegSlots"]) for value in allocations)
+
+
+def test_shared_operation_sse_snapshots_and_disconnect(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        manager = OperationManager(EpisodeService())
+        manager.set_concurrency(1)
+        root = tmp_path / "raw"
+        relative = "task/episode_000001"
+        (root / relative / "videos").mkdir(parents=True)
+        first_release = threading.Event()
+        second_release = threading.Event()
+        third_release = threading.Event()
+        second_started = threading.Event()
+        third_started = threading.Event()
+
+        def fake_run(state, _request):
+            if state.episode.endswith("000001"):
+                assert first_release.wait(5)
+                manager._update(state, 1.0, "已完成", status="completed", result={"outputPath": state.target_key})
+            elif state.episode.endswith("000002"):
+                second_started.set()
+                assert second_release.wait(5)
+                raise WorkbenchError("injected failure")
+            else:
+                third_started.set()
+                assert third_release.wait(5)
+                manager._update(state, 1.0, "已完成", status="completed", result={"outputPath": state.target_key})
+
+        manager._run = fake_run
+        body = {
+            "mode": "no_trim", "sourceRoot": str(root), "episode": relative,
+            "outputRoot": str(tmp_path / "out-1"), "operator": "tester",
+            "sourceToken": "token", "ranges": [], "overwrite": False,
+        }
+        first = manager.create(body)
+        deadline = time.monotonic() + 2
+        while first.status != "running" and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert first.status == "running"
+        for number in (2, 3):
+            episode = f"task/episode_{number:06d}"
+            (root / episode / "videos").mkdir(parents=True)
+            manager.create({**body, "episode": episode, "outputRoot": str(tmp_path / f"out-{number}")})
+
+        request = DisconnectRequest()
+        stream = operation_snapshot_events(manager, request)
+        initial = parse_snapshot(await asyncio.wait_for(anext(stream), 1))
+        assert initial["running"][0]["id"] == first.id
+        assert [item["queuePosition"] for item in initial["queued"]] == [1, 2]
+
+        manager._update(first, 0.5, "halfway", status="running")
+        progress = parse_snapshot(await asyncio.wait_for(anext(stream), 1))
+        assert progress["running"][0]["progress"] == 0.5
+        assert progress["running"][0]["message"] == "halfway"
+
+        first_release.set()
+        assert await asyncio.to_thread(second_started.wait, 2)
+        await asyncio.sleep(0.25)
+        shifted = parse_snapshot(await asyncio.wait_for(anext(stream), 1))
+        assert shifted["running"][0]["episode"].endswith("000002")
+        assert shifted["queued"][0]["queuePosition"] == 1
+        assert any(item["status"] == "completed" for item in shifted["completed"])
+
+        second_release.set()
+        assert await asyncio.to_thread(third_started.wait, 2)
+        await asyncio.sleep(0.25)
+        failed = parse_snapshot(await asyncio.wait_for(anext(stream), 1))
+        assert failed["running"][0]["episode"].endswith("000003")
+        assert any(item["status"] == "failed" for item in failed["completed"])
+
+        third_release.set()
+        await asyncio.sleep(0.25)
+        terminal = parse_snapshot(await asyncio.wait_for(anext(stream), 1))
+        assert not terminal["queued"] and not terminal["running"]
+        assert {item["status"] for item in terminal["completed"]} >= {"completed", "failed"}
+
+        request.disconnected = True
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(stream), 1)
+
+    asyncio.run(scenario())
