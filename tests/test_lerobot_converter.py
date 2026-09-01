@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -85,62 +86,94 @@ for name in ('numpy', 'av', 'cv2', 'torch', 'lerobot'):
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
-def test_action_is_fixed_20d_and_uses_frame_t_flat_commands() -> None:
-    current = record(0, {}, {
-        "commands.SET_LEFT_GRIPPER_SPEED": 0.0,
-        "commands.SET_LEFT_FORCE": 2.5,
-        "commands.SET_RIGHT_GRIPPER_SPEED": -3.0,
-    })
+def test_dual_actions_use_exact_axes_next_state_and_joint_grippers() -> None:
+    current = record(0, {}, {"commands.SET_LEFT_FORCE": float("nan")})
     following = record(1, {})
-    action = converter.build_action(current, following)
-    assert converter.ACTION_NAMES[6:10] == [
-        "left.gripper_speed", "left.gripper_force",
-        "left.gripper_speed_valid", "left.gripper_force_valid",
-    ]
-    assert len(action) == 20
-    assert action[:6] == pytest.approx([1.0, 0.5, 0.0, 0.0, 0.0, 0.0])
-    assert action[6:10] == [0.0, 2.5, 1.0, 1.0]
-    assert action[10:16] == pytest.approx([2.0, 0.5, 0.0, 0.0, 0.0, 0.0])
-    assert action[16:20] == [-3.0, 0.0, 1.0, 0.0]
+    qpos = [100.0 + index for index in range(23)]
+    following["joints"]["position"] = qpos
+
+    hybrid = converter.build_action(current, following, action_mode=converter.BODY_JOINT_EEF)
+    whole = converter.build_action(current, following, action_mode=converter.WHOLE_BODY_JOINT)
+
+    assert len(hybrid) == 21
+    assert hybrid[:4] == qpos[:4]
+    assert hybrid[4:10] == pytest.approx([1.0, 0.5, 0.0, 0.0, 0.0, 0.0])
+    assert hybrid[10] == 118.0
+    assert hybrid[11:17] == pytest.approx([2.0, 0.5, 0.0, 0.0, 0.0, 0.0])
+    assert hybrid[17] == 119.0
+    assert hybrid[18:] == [120.0, 121.0, 122.0]
+    assert whole == qpos
+    assert converter.BODY_JOINT_EEF_ACTION_NAMES[10] == "left.gripper"
+    assert converter.BODY_JOINT_EEF_ACTION_NAMES[17] == "right.gripper"
 
 
-def test_action_distinguishes_missing_from_real_zero_and_accepts_nested_commands() -> None:
-    missing = converter.build_action(record(0, {}, None), record(1, {}))
-    assert missing[6:10] == [0.0, 0.0, 0.0, 0.0]
-    assert missing[16:20] == [0.0, 0.0, 0.0, 0.0]
+def test_terminal_actions_hold_joints_and_zero_eef_delta() -> None:
+    terminal = record(7, {}, {"commands.SET_RIGHT_FORCE": "ignored"})
+    qpos = [-10.0 + index * 0.5 for index in range(23)]
+    terminal["joints"]["position"] = qpos
 
-    nested = converter.build_action(
-        record(0, {}, {"commands": {"SET_LEFT_GRIPPER_SPEED": 0, "SET_RIGHT_FORCE": 0}}),
-        record(1, {}),
+    hybrid = converter.build_action(terminal, action_mode=converter.BODY_JOINT_EEF)
+    whole = converter.build_action(terminal, action_mode=converter.WHOLE_BODY_JOINT)
+
+    assert hybrid[:4] == qpos[:4]
+    assert hybrid[4:10] == [0.0] * 6
+    assert hybrid[10] == qpos[18]
+    assert hybrid[11:17] == [0.0] * 6
+    assert hybrid[17] == qpos[19]
+    assert hybrid[18:] == qpos[20:23]
+    assert whole == qpos
+
+
+def test_relative_pose_delta_is_expressed_in_current_local_frame() -> None:
+    half = math.sqrt(0.5)
+    current = [0.0, 0.0, 0.0, 0.0, 0.0, half, half]
+    following = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+
+    delta = converter.relative_pose_delta(current, following)
+
+    assert delta[:3] == pytest.approx([0.0, -1.0, 0.0], abs=1e-7)
+    assert delta[3:] == pytest.approx([0.0, 0.0, math.pi / 2], abs=1e-7)
+    assert converter.relative_pose_delta(current, [*current[:3], 0.0, 0.0, -half, -half]) == pytest.approx(
+        [0.0] * 6, abs=1e-7
     )
-    assert nested[6:10] == [0.0, 0.0, 1.0, 0.0]
-    assert nested[16:20] == [0.0, 0.0, 0.0, 1.0]
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), True, "4"])
-def test_non_finite_or_non_numeric_present_command_is_rejected(value) -> None:
-    with pytest.raises(ValueError, match="finite"):
-        converter.build_action(
-            record(0, {}, {"commands.SET_LEFT_FORCE": value}), record(1, {})
-        )
+def test_make_frame_keeps_shared_38d_observation_and_terminal_source_fields() -> None:
+    np = pytest.importorskip("numpy")
+    source = converter.SourceEpisode(
+        Path("episode_000007"), 7, "english task", 30, {}, [record(3, {})], {},
+    )
+    source.records[0]["joints"]["position"] = [float(index) for index in range(23)]
+
+    whole = converter._make_frame(source, 0, {}, np, converter.WHOLE_BODY_JOINT)
+    hybrid = converter._make_frame(source, 0, {}, np, converter.BODY_JOINT_EEF)
+
+    assert whole["observation.state"].shape == (38,)
+    assert np.array_equal(whole["observation.state"], hybrid["observation.state"])
+    assert int(whole["source.frame_index"][0]) == 3
+    assert int(whole["source.timestamp_ns"][0]) == 1_000_000_003
+    assert int(whole["source.episode_id"][0]) == 7
+    assert whole["action"].shape == (23,)
+    assert hybrid["action"].shape == (21,)
 
 
-def test_all_active_rgb_depth_and_extra_streams_become_features(tmp_path: Path) -> None:
+def test_training_features_are_three_rgb_streams_with_mode_specific_actions(tmp_path: Path) -> None:
     source = make_source(tmp_path)
-    features = converter.build_features(source.videos)
+    features = converter.build_features(source.videos, converter.BODY_JOINT_EEF)
     assert list(key for key in features if key.startswith("observation.images.")) == [
         "observation.images.rgbd_head_color",
         "observation.images.hand_left",
         "observation.images.hand_right",
-        "observation.images.head_right",
-        "observation.images.rgbd_head_depth",
     ]
-    depth = features["observation.images.rgbd_head_depth"]
-    assert depth["shape"] == (32, 48, 1)
-    assert depth["info"]["is_depth_map"] is True
-    assert features["action"]["shape"] == (20,)
-    assert features["action"]["names"]["axes"] == converter.ACTION_NAMES
+    assert features["action"]["shape"] == (21,)
+    assert features["action"]["names"]["axes"] == converter.BODY_JOINT_EEF_ACTION_NAMES
+    whole = converter.build_features(source.videos, converter.WHOLE_BODY_JOINT)
+    assert whole["action"]["shape"] == (23,)
     assert "joint_position.Joint_Left_Gripper" in features["observation.state"]["names"]["axes"]
+    assert features["observation.state"]["shape"] == (38,)
+    assert converter.JOINT_NAMES[-3:] == [
+        "Joint_Neck_Yaw", "Joint_Neck_Pitch", "Joint_Neck_Roll",
+    ]
 
 
 def test_load_source_episode_preserves_all_valid_streams_and_ignores_empty_reference(tmp_path: Path) -> None:
@@ -165,11 +198,118 @@ def test_load_source_episode_preserves_all_valid_streams_and_ignores_empty_refer
     assert "unused_camera" not in loaded.videos
 
 
-def test_last_frame_has_no_action() -> None:
+def test_load_source_episode_default_task_is_normalized_english_title(tmp_path: Path) -> None:
+    source = make_source(tmp_path)
+    (source.path / "task_meta.json").write_text(
+        json.dumps({"task_title": "pick_the_egg_tart", "task_description": "拿起蛋挞"}),
+        encoding="utf-8",
+    )
+
+    loaded = converter.load_source_episode(
+        source.path,
+        video_probe=lambda path, stream: source.videos[stream],
+    )
+
+    assert loaded.task == "pick the egg tart"
+
+
+def test_all_source_frames_are_retained_including_single_frame_episode() -> None:
     source = converter.SourceEpisode(Path("episode_1"), 1, "task", 30, {}, [{}, {}, {}], {})
-    assert converter.converted_episode_length(source) == 2
-    with pytest.raises(ValueError, match="at least two"):
-        converter.converted_episode_length(replace(source, records=[{}]))
+    assert converter.converted_episode_length(source) == 3
+    assert converter.converted_episode_length(replace(source, records=[{}])) == 1
+
+
+def test_hybrid_action_rewrite_updates_embedded_huggingface_schema(tmp_path: Path) -> None:
+    datasets = pytest.importorskip("datasets")
+    pa = pytest.importorskip("pyarrow")
+    np = pytest.importorskip("numpy")
+    from datasets.arrow_dataset import update_metadata_with_features
+
+    first = make_source(tmp_path / "task_a")
+    second = make_source(tmp_path / "task_b")
+    second.records[1]["joints"]["position"] = [200.0 + index for index in range(23)]
+    owner_features = datasets.Features({
+        "episode_index": datasets.Value("int64"),
+        "source.episode_id": datasets.Value("int64"),
+        "source.frame_index": datasets.Value("int64"),
+        "action": datasets.Sequence(datasets.Value("float32"), length=23),
+    })
+    table = datasets.Dataset.from_dict(
+        {
+            "episode_index": [0, 1],
+            "source.episode_id": [1, 1],
+            "source.frame_index": [0, 0],
+            "action": [[0.0] * 23, [0.0] * 23],
+        },
+        features=owner_features,
+    ).data.table
+    hybrid_features = datasets.Features({
+        "episode_index": datasets.Value("int64"),
+        "source.episode_id": datasets.Value("int64"),
+        "source.frame_index": datasets.Value("int64"),
+        "action": datasets.Sequence(datasets.Value("float32"), length=21),
+    })
+
+    rewritten, actions, _ = converter._replace_action_column(
+        {"pa": pa, "np": np, "update_metadata_with_features": update_metadata_with_features},
+        table,
+        {0: first, 1: second},
+        hybrid_features,
+    )
+
+    metadata = json.loads(rewritten.schema.metadata[b"huggingface"])
+    assert rewritten.schema.field("action").type.list_size == 21
+    assert metadata["info"]["features"]["action"]["length"] == 21
+    assert actions.shape == (2, 21)
+    assert actions[0].tolist() == pytest.approx(
+        converter.build_action(first.records[0], first.records[1], action_mode=converter.BODY_JOINT_EEF)
+    )
+    assert actions[1].tolist() == pytest.approx(
+        converter.build_action(second.records[0], second.records[1], action_mode=converter.BODY_JOINT_EEF)
+    )
+    assert actions[0, 10] != actions[1, 10]
+
+
+def test_video_encoding_mode_accepts_parallel_without_changing_default() -> None:
+    assert converter.ConverterConfig().video_encoding_mode == "sequential"
+    assert converter.ConverterConfig(video_encoding_mode="parallel").video_encoding_mode == "parallel"
+    with pytest.raises(ValueError, match="sequential, parallel, or streaming"):
+        converter.ConverterConfig(video_encoding_mode="invalid")
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_parallel"),
+    (("sequential", False), ("parallel", True), ("streaming", False)),
+)
+def test_append_one_selects_requested_video_encoding_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_parallel: bool,
+) -> None:
+    source = make_source(tmp_path)
+    calls: list[bool] = []
+
+    class Dataset:
+        meta = type("Meta", (), {"total_episodes": 0})()
+
+        def save_episode(self, *, parallel_encoding: bool) -> None:
+            calls.append(parallel_encoding)
+
+        def finalize(self) -> None:
+            pass
+
+    monkeypatch.setattr(converter, "_open_dataset", lambda *args, **kwargs: Dataset())
+    monkeypatch.setattr(converter, "_add_frames", lambda *args, **kwargs: None)
+    monkeypatch.setattr(converter, "_verify_episode", lambda *args, **kwargs: None)
+
+    index = converter._append_one(
+        {}, tmp_path / "output", "autolife/task", source,
+        converter.ConverterConfig(video_encoding_mode=mode), create=True,
+    )
+
+    assert index == 0
+    assert calls == [expected_parallel]
 
 
 def test_schema_baseline_uses_largest_group_and_first_on_tie(tmp_path: Path) -> None:
@@ -183,6 +323,35 @@ def test_schema_baseline_uses_largest_group_and_first_on_tie(tmp_path: Path) -> 
     assert accepted == [first]
 
 
+def test_auxiliary_schema_differences_do_not_reject_training_compatible_episode(tmp_path: Path) -> None:
+    first = make_source(tmp_path / "a", 1)
+    second = make_source(tmp_path / "b", 2)
+    second_videos = dict(second.videos)
+    depth = second_videos["rgbd_head_depth"]
+    second_videos["rgbd_head_depth"] = replace(depth, width=96)
+    second = replace(second, videos=second_videos)
+
+    accepted, skipped = converter.select_compatible_episodes([first, second])
+
+    assert accepted == [first, second]
+    assert skipped == []
+
+
+def test_empty_auxiliary_set_still_creates_shareable_index(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    source = make_source(tmp_path / "source", extra_streams=())
+    root = tmp_path / "owner"
+
+    converter._ensure_auxiliary_episode(
+        {"pa": pa, "pq": pq}, root, 0, source, converter.ConverterConfig(),
+    )
+
+    index = root / converter.AUXILIARY_INDEX_PATH
+    assert index.is_file()
+    assert pq.read_table(index).num_rows == 0
+
+
 def test_state_rejects_legacy_14d_output(tmp_path: Path) -> None:
     root = tmp_path / "output"
     root.mkdir()
@@ -190,7 +359,7 @@ def test_state_rejects_legacy_14d_output(tmp_path: Path) -> None:
         json.dumps({"version": 1, "conversion_config": {"action_dim": 14}, "episodes": []}),
         encoding="utf-8",
     )
-    with pytest.raises(converter.StateConflictError, match="20-D action schema"):
+    with pytest.raises(converter.StateConflictError, match="v2/20-D output"):
         converter.load_conversion_state(root)
 
 
@@ -239,6 +408,249 @@ def test_incremental_state_rejects_config_revision_missing_rename_and_duplicates
         )
 
 
+def test_merged_state_uses_relative_paths_for_duplicate_ids_and_incremental_validation(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    first = replace(make_source(source_root / "task_a", 1), task="task a")
+    second = replace(make_source(source_root / "task_b", 1), task="task b")
+    third = replace(make_source(source_root / "task_c", 1), task="task c")
+    config = converter.ConverterConfig()
+    state = converter.new_conversion_state(
+        source_root,
+        "autolife/whole_body_joint",
+        config,
+        converter.schema_for_episode(first),
+        None,
+        dataset_layout=converter.MERGED_DATASET_LAYOUT,
+    )
+
+    assert converter.validate_incremental_state(
+        state,
+        [first, second],
+        source_task=source_root,
+        repo_id="autolife/whole_body_joint",
+        config=config,
+        dataset_layout=converter.MERGED_DATASET_LAYOUT,
+    ) == [first, second]
+    converter._append_state_episode(
+        state, first, 0, dataset_layout=converter.MERGED_DATASET_LAYOUT,
+        source_root=source_root,
+    )
+    converter._append_state_episode(
+        state, second, 1, dataset_layout=converter.MERGED_DATASET_LAYOUT,
+        source_root=source_root,
+    )
+
+    assert [entry["source_relative_path"] for entry in state["episodes"]] == [
+        "task_a/episode_000001", "task_b/episode_000001",
+    ]
+    assert [entry["stored_task"] for entry in state["episodes"]] == ["task a", "task b"]
+    assert state["stored_tasks"] == ["task a", "task b"]
+    assert converter.validate_incremental_state(
+        state,
+        [first, second],
+        source_task=source_root,
+        repo_id="autolife/whole_body_joint",
+        config=config,
+        dataset_layout=converter.MERGED_DATASET_LAYOUT,
+    ) == []
+    assert converter.validate_incremental_state(
+        state,
+        [first, second, third],
+        source_task=source_root,
+        repo_id="autolife/whole_body_joint",
+        config=config,
+        dataset_layout=converter.MERGED_DATASET_LAYOUT,
+    ) == [third]
+
+    common = {
+        "source_task": source_root,
+        "repo_id": "autolife/whole_body_joint",
+        "config": config,
+        "dataset_layout": converter.MERGED_DATASET_LAYOUT,
+    }
+    with pytest.raises(converter.StateConflictError, match="missing"):
+        converter.validate_incremental_state(state, [first], **common)
+    with pytest.raises(converter.StateConflictError, match="changed stored task"):
+        converter.validate_incremental_state(
+            state, [replace(first, task="changed"), second], **common,
+        )
+    with pytest.raises(converter.StateConflictError, match="changed numeric id"):
+        converter.validate_incremental_state(
+            state, [first, replace(second, source_episode_id=2)], **common,
+        )
+    with pytest.raises(converter.StateConflictError, match="duplicate source relative path"):
+        converter.validate_incremental_state(
+            state, [first, replace(second, path=first.path)], **common,
+        )
+    renamed = replace(second, path=source_root / "task_renamed" / second.path.name)
+    with pytest.raises(converter.StateConflictError, match="missing"):
+        converter.validate_incremental_state(state, [first, renamed], **common)
+
+
+def test_merged_recovery_uses_pending_relative_path_when_numeric_ids_collide(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    first = replace(make_source(source_root / "task_a", 1), task="task a")
+    second = replace(make_source(source_root / "task_b", 1), task="task b")
+    output = tmp_path / "output"
+    output.mkdir()
+    config = converter.ConverterConfig()
+    state = converter.new_conversion_state(
+        source_root, "autolife/whole_body_joint", config,
+        converter.schema_for_episode(first), None,
+        dataset_layout=converter.MERGED_DATASET_LAYOUT,
+    )
+    converter._append_state_episode(
+        state, first, 0, dataset_layout=converter.MERGED_DATASET_LAYOUT,
+        source_root=source_root,
+    )
+    converter._write_state(output, state)
+    converter._mark_pending_episode(
+        output, state, second, 1, dataset_layout=converter.MERGED_DATASET_LAYOUT,
+        source_root=source_root,
+    )
+    verified: list[Path] = []
+    monkeypatch.setattr(converter, "_dataset_episode_count", lambda *args: 2)
+    monkeypatch.setattr(
+        converter, "_verify_episode",
+        lambda runtime, root, repo_id, index, episode, action_mode: verified.append(episode.path),
+    )
+    monkeypatch.setattr(converter, "_ensure_auxiliary_episode", lambda *args: None)
+
+    recovered = converter._recover_uncommitted_state(
+        {}, output, "autolife/whole_body_joint", state, [first, second], config,
+        dataset_layout=converter.MERGED_DATASET_LAYOUT, source_root=source_root,
+    )
+
+    assert recovered == [1]
+    assert verified == [second.path]
+    assert state["episodes"][1]["source_relative_path"] == "task_b/episode_000001"
+    assert "pending_episode" not in state
+
+
+def test_convert_merged_bundle_uses_shared_roots_layout_and_path_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    episodes = [
+        replace(make_source(source_root / "task_a", 1), task="task a"),
+        replace(make_source(source_root / "task_b", 1), task="task b"),
+    ]
+    bundle_root = tmp_path / "bundle"
+    calls: dict[str, tuple] = {}
+
+    def owner_convert(items, output_root, repo_id, **kwargs):
+        calls["owner"] = (output_root, repo_id, kwargs)
+        state = converter.new_conversion_state(
+            kwargs["source_task"], repo_id, kwargs["config"],
+            converter.schema_for_episode(items[0]), None,
+            dataset_layout=kwargs["dataset_layout"],
+        )
+        for index, episode in enumerate(items):
+            converter._append_state_episode(
+                state, episode, index, dataset_layout=converter.MERGED_DATASET_LAYOUT,
+                source_root=source_root,
+            )
+        return converter.ConversionResult(
+            output_root, True, (), (0, 1), (), (), state,
+        )
+
+    def hybrid_derive(items, owner_root, hybrid_root, repo_id, **kwargs):
+        calls["hybrid"] = (owner_root, hybrid_root, repo_id, kwargs)
+        owner_state = calls["owner_result"].state
+        state = converter.new_conversion_state(
+            source_root, repo_id, kwargs["config"], owner_state["schema"], None,
+            converter.BODY_JOINT_EEF, os.path.relpath(owner_root, start=hybrid_root),
+            converter.MERGED_DATASET_LAYOUT,
+        )
+        state["episodes"] = [dict(entry) for entry in owner_state["episodes"]]
+        return converter.ConversionResult(
+            hybrid_root, True, (), (0, 1), (), (), state,
+        )
+
+    def owner_wrapper(*args, **kwargs):
+        result = owner_convert(*args, **kwargs)
+        calls["owner_result"] = result
+        return result
+
+    monkeypatch.setattr(converter, "convert_task", owner_wrapper)
+    monkeypatch.setattr(converter, "derive_hybrid_dataset", hybrid_derive)
+
+    result = converter.convert_merged_bundle(
+        episodes, bundle_root, "autolife", source_root=source_root,
+    )
+
+    owner_root, owner_repo, owner_kwargs = calls["owner"]
+    hybrid_owner, hybrid_root, hybrid_repo, hybrid_kwargs = calls["hybrid"]
+    assert owner_root == bundle_root / converter.WHOLE_BODY_JOINT
+    assert hybrid_owner == owner_root
+    assert hybrid_root == bundle_root / converter.BODY_JOINT_EEF
+    assert owner_repo == "autolife/whole_body_joint"
+    assert hybrid_repo == "autolife/body_joint_eef"
+    assert owner_kwargs["dataset_layout"] == converter.MERGED_DATASET_LAYOUT
+    assert owner_kwargs["source_task"] == source_root.resolve()
+    assert hybrid_kwargs["source_task"] == source_root.resolve()
+    assert [entry["source_relative_path"] for entry in result.ledger["episodes"]] == [
+        "task_a/episode_000001", "task_b/episode_000001",
+    ]
+    assert result.ledger["stored_tasks"] == ["task a", "task b"]
+    assert all(
+        status["status"] == "committed" and status["outcome"] == "appended"
+        for entry in result.ledger["episodes"] for status in entry["modes"].values()
+    )
+    assert (bundle_root / ".bundle/bundle_state.json").is_file()
+
+
+def test_merged_hybrid_noop_avoids_heavy_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source_root = tmp_path / "source"
+    source = replace(make_source(source_root / "task_a", 1), task="task a")
+    owner = tmp_path / converter.WHOLE_BODY_JOINT
+    hybrid = tmp_path / converter.BODY_JOINT_EEF
+    (owner / "videos").mkdir(parents=True)
+    (owner / "auxiliary").mkdir()
+    hybrid.mkdir()
+    config = converter.ConverterConfig()
+    owner_state = converter.new_conversion_state(
+        source_root, "autolife/whole_body_joint", config,
+        converter.schema_for_episode(source), None,
+        dataset_layout=converter.MERGED_DATASET_LAYOUT,
+    )
+    converter._append_state_episode(
+        owner_state, source, 0, dataset_layout=converter.MERGED_DATASET_LAYOUT,
+        source_root=source_root,
+    )
+    converter._write_state(owner, owner_state)
+    shared_owner = os.path.relpath(owner, start=hybrid)
+    hybrid_state = converter.new_conversion_state(
+        source_root, "autolife/body_joint_eef", config, owner_state["schema"], None,
+        converter.BODY_JOINT_EEF, shared_owner, converter.MERGED_DATASET_LAYOUT,
+    )
+    hybrid_state["episodes"] = [dict(owner_state["episodes"][0])]
+    hybrid_state["stored_tasks"] = [source.task]
+    converter._write_state(hybrid, hybrid_state)
+    (hybrid / "videos").symlink_to(
+        os.path.relpath(owner / "videos", start=hybrid), target_is_directory=True,
+    )
+    (hybrid / "auxiliary").symlink_to(
+        os.path.relpath(owner / "auxiliary", start=hybrid), target_is_directory=True,
+    )
+    monkeypatch.setattr(
+        converter, "_heavy_runtime",
+        lambda: pytest.fail("no-op hybrid derivation loaded heavy dependencies"),
+    )
+
+    result = converter.derive_hybrid_dataset(
+        [source], owner, hybrid, "autolife/body_joint_eef",
+        source_task=source_root, config=config,
+    )
+
+    assert result.existing_episode_indices == (0,)
+    assert result.appended_episode_indices == ()
+
+
 def test_initial_publish_uses_sibling_staging_and_preserves_preflight_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -252,12 +664,13 @@ def test_initial_publish_uses_sibling_staging_and_preserves_preflight_report(
 
     monkeypatch.setattr(converter, "_heavy_runtime", lambda: {})
 
-    def append_one(runtime, root, repo_id, episode, config, *, create):
+    def append_one(runtime, root, repo_id, episode, config, *, create, action_mode):
         root.mkdir(parents=True, exist_ok=True)
         calls.append((root, episode.source_episode_id, create))
         return len(calls) - 1
 
     monkeypatch.setattr(converter, "_append_one", append_one)
+    monkeypatch.setattr(converter, "_ensure_auxiliary_episode", lambda *args, **kwargs: None)
     result = converter.convert_task(
         sources, output, "autolife/task", source_task=task,
     )
@@ -268,10 +681,154 @@ def test_initial_publish_uses_sibling_staging_and_preserves_preflight_report(
     assert (output / "conversion_report.json").read_bytes() == report
     state = converter.load_conversion_state(output)
     assert state is not None
-    assert state["conversion_config"]["action_dim"] == 20
+    assert state["conversion_config"]["action_dim"] == 23
+    assert state["action_mode"] == converter.WHOLE_BODY_JOINT
     assert state["stored_task"] == "stored task"
     assert [item["source_episode_id"] for item in state["episodes"]] == [1, 2]
     assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_promotion_validates_all_consumers_before_exposing_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_task = tmp_path / "source"
+    source = make_source(source_task, 1)
+    owner = tmp_path / converter.WHOLE_BODY_JOINT / "task"
+    (owner / "meta").mkdir(parents=True)
+    info_path = owner / "meta/info.json"
+    info_path.write_text('{"features":{"sentinel":{}}}\n', encoding="utf-8")
+    state = converter.new_conversion_state(
+        source_task,
+        "autolife/owner",
+        converter.ConverterConfig(),
+        converter.schema_for_episode(source),
+        source.task,
+    )
+    state["episodes"].append(converter._state_entry(source, 0))
+    converter.atomic_write_json(owner / converter.CONVERSION_STATE_FILENAME, state)
+    signature = converter.source_episode_signature(source)["digest"]
+    monkeypatch.setattr(converter, "_heavy_runtime", lambda: {})
+    monkeypatch.setattr(
+        converter,
+        "_read_auxiliary_rows",
+        lambda runtime, root: [{
+            "episode_index": 0,
+            "source_episode_id": 1,
+            "stream": "head_right",
+            "frame_count": 3,
+            "source_signature": signature,
+            "width": 48,
+            "height": 32,
+            "fps": 30.0,
+            "is_depth": False,
+            "feature_info_json": "{}",
+        }],
+    )
+    original = info_path.read_bytes()
+
+    with pytest.raises(converter.StateConflictError, match="consumer is missing"):
+        converter.promote_aux_videos(
+            owner, ["head_right"], consumer_roots=[tmp_path / "missing-consumer"],
+        )
+
+    assert info_path.read_bytes() == original
+
+
+def test_promotion_rejects_consumer_with_different_episode_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_task = tmp_path / "source"
+    source = make_source(source_task, 1)
+    owner = tmp_path / converter.WHOLE_BODY_JOINT / "task"
+    consumer = tmp_path / converter.BODY_JOINT_EEF / "task"
+    for root in (owner, consumer):
+        (root / "meta").mkdir(parents=True)
+        (root / "videos").mkdir()
+    (owner / "meta/info.json").write_text('{"features":{}}\n', encoding="utf-8")
+    owner_state = converter.new_conversion_state(
+        source_task, "autolife/owner", converter.ConverterConfig(),
+        converter.schema_for_episode(source), source.task,
+    )
+    owner_state["episodes"].append(converter._state_entry(source, 0))
+    converter.atomic_write_json(owner / converter.CONVERSION_STATE_FILENAME, owner_state)
+    consumer_state = converter.new_conversion_state(
+        source_task, "autolife/consumer", converter.ConverterConfig(),
+        converter.schema_for_episode(source), source.task, converter.BODY_JOINT_EEF,
+        os.path.relpath(owner, start=consumer),
+    )
+    consumer_entry = converter._state_entry(source, 0)
+    consumer_entry["source_episode_id"] = 99
+    consumer_state["episodes"].append(consumer_entry)
+    converter.atomic_write_json(consumer / converter.CONVERSION_STATE_FILENAME, consumer_state)
+    (consumer / "videos").rmdir()
+    (consumer / "videos").symlink_to(
+        os.path.relpath(owner / "videos", start=consumer), target_is_directory=True,
+    )
+    signature = converter.source_episode_signature(source)["digest"]
+    monkeypatch.setattr(converter, "_heavy_runtime", lambda: {})
+    monkeypatch.setattr(
+        converter, "_read_auxiliary_rows",
+        lambda runtime, root: [{
+            "episode_index": 0, "source_episode_id": 1, "stream": "head_right",
+            "frame_count": 3, "source_signature": signature, "width": 48,
+            "height": 32, "fps": 30.0, "is_depth": False, "feature_info_json": "{}",
+        }],
+    )
+
+    with pytest.raises(converter.StateConflictError, match="metadata differs"):
+        converter.promote_aux_videos(owner, ["head_right"], consumer_roots=[consumer])
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (("source_relative_path", "other/episode_000001"), ("stored_task", "different task")),
+)
+def test_merged_promotion_rejects_consumer_path_or_per_episode_task_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, replacement: str,
+) -> None:
+    source_root = tmp_path / "source"
+    source = replace(make_source(source_root / "task_a", 1), task="task a")
+    owner = tmp_path / converter.WHOLE_BODY_JOINT
+    consumer = tmp_path / converter.BODY_JOINT_EEF
+    (owner / "videos").mkdir(parents=True)
+    consumer.mkdir()
+    (consumer / "videos").symlink_to(
+        os.path.relpath(owner / "videos", start=consumer), target_is_directory=True,
+    )
+    config = converter.ConverterConfig()
+    owner_state = converter.new_conversion_state(
+        source_root, "autolife/whole_body_joint", config,
+        converter.schema_for_episode(source), None,
+        dataset_layout=converter.MERGED_DATASET_LAYOUT,
+    )
+    converter._append_state_episode(
+        owner_state, source, 0, dataset_layout=converter.MERGED_DATASET_LAYOUT,
+        source_root=source_root,
+    )
+    converter._write_state(owner, owner_state)
+    consumer_state = converter.new_conversion_state(
+        source_root, "autolife/body_joint_eef", config, owner_state["schema"], None,
+        converter.BODY_JOINT_EEF, os.path.relpath(owner, start=consumer),
+        converter.MERGED_DATASET_LAYOUT,
+    )
+    consumer_entry = dict(owner_state["episodes"][0])
+    consumer_entry[field] = replacement
+    consumer_state["episodes"] = [consumer_entry]
+    consumer_state["stored_tasks"] = [str(consumer_entry["stored_task"])]
+    converter._write_state(consumer, consumer_state)
+    signature = converter.source_episode_signature(source)["digest"]
+    monkeypatch.setattr(converter, "_heavy_runtime", lambda: {})
+    monkeypatch.setattr(
+        converter, "_read_auxiliary_rows",
+        lambda runtime, root: [{
+            "episode_index": 0, "source_episode_id": 1, "stream": "head_right",
+            "frame_count": 3, "source_signature": signature, "width": 48,
+            "height": 32, "fps": 30.0, "is_depth": False, "feature_info_json": "{}",
+        }],
+    )
+
+    with pytest.raises(converter.StateConflictError, match=f"metadata differs from owner at {field}"):
+        converter.promote_aux_videos(owner, ["head_right"], consumer_roots=[consumer])
 
 
 @pytest.mark.skipif(

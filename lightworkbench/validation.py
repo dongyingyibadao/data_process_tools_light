@@ -90,6 +90,16 @@ class EpisodeValidation:
         }
 
     @property
+    def training_schema(self) -> dict[str, Any]:
+        schema = self.schema
+        schema["videos"] = {
+            name: schema["videos"][name]
+            for name in REQUIRED_COLOR_STREAMS
+            if name in schema["videos"]
+        }
+        return schema
+
+    @property
     def signature(self) -> str:
         return self.output_fingerprint
 
@@ -271,6 +281,9 @@ def _manifest(path: Path, result: EpisodeValidation) -> tuple[dict[str, Any], li
                         result.reasons.append("manifest_header_not_first")
                     if not header:
                         header = row
+                elif row.get("_type") == "session_footer":
+                    if row.get("aborted") is True:
+                        result.reasons.append("manifest_session_aborted")
                 elif isinstance(row.get("_type"), str):
                     continue
                 else:

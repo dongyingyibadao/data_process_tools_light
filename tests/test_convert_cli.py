@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from lightworkbench import cli
 from lightworkbench.validation import (
+    EpisodeValidation,
     FINGERPRINT_VERSION,
     TIMESTAMP_REWRITE_VERSION,
     output_fingerprint,
@@ -122,6 +125,50 @@ def refresh_audit_fingerprint(episode: Path) -> None:
     path.write_text(json.dumps(audit), encoding="utf-8")
 
 
+def test_parallel_preflight_is_bounded_and_preserves_input_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = [tmp_path / f"episode_{index:06d}" for index in (10, 2, 3, 4)]
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+    require_source_values: list[bool] = []
+
+    def fake_validate(
+        input_root: Path, episode: Path, *, require_source: bool,
+    ) -> EpisodeValidation:
+        del input_root
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            require_source_values.append(require_source)
+        try:
+            barrier.wait(timeout=2)
+            if episode == paths[0]:
+                time.sleep(0.05)
+            return EpisodeValidation(episode, episode.name, "task")
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(cli, "validate_episode", fake_validate)
+    monkeypatch.setitem(cli.RESOURCES, "budget", 2)
+
+    checked, workers = cli._validate_episodes(
+        tmp_path,
+        paths,
+        require_source=True,
+        requested_workers=10,
+    )
+
+    assert workers == 2
+    assert max_active == 2
+    assert require_source_values == [True] * len(paths)
+    assert [item.path for item in checked] == paths
+
+
 def test_strict_validation_fingerprint_control_mask_and_source_policy(tmp_path: Path) -> None:
     root = tmp_path / "cleaned"
     relative = "289/date/task/episode_000001"
@@ -172,6 +219,40 @@ def test_validation_rejects_missing_converter_fields_and_bad_video_frame_id(tmp_
     assert "video_frame_id_mismatch:hand_left:0" in checked.reasons
 
 
+def test_merged_preflight_skips_aborted_session_footer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    aborted = make_cleaned_episode(root, "day/task/episode_000001")
+    manifest = aborted / "manifest.jsonl"
+    with manifest.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "_type": "session_footer", "aborted": True, "reason": "FAILURE",
+        }) + "\n")
+    refresh_audit_fingerprint(aborted)
+    make_cleaned_episode(root, "day/task/episode_000002")
+    output = tmp_path / "merged"
+    monkeypatch.setattr(
+        "lightworkbench.validation.probe_video",
+        lambda path, decoded=True: fake_probe(path),
+    )
+
+    code = cli.main([
+        "convert-merged", "--input-root", str(root), "--output-root", str(output),
+        "--preflight-only",
+    ])
+
+    assert code == 1
+    report = json.loads((output / "conversion_report.json").read_text(encoding="utf-8"))
+    assert [item["episode"] for item in report["accepted"]] == [
+        "day/task/episode_000002",
+    ]
+    assert [(item["episode"], item["reasons"]) for item in report["skipped"]] == [
+        ("day/task/episode_000001", ["manifest_session_aborted"]),
+    ]
+    assert report["failed"] == []
+
+
 def test_rejects_unverified_nested_timestamp_stitching(tmp_path: Path) -> None:
     root = tmp_path / "cleaned"
     relative = "289/date/task/episode_000002"
@@ -200,6 +281,8 @@ def test_preflight_natural_discovery_language_and_atomic_reports(tmp_path: Path,
     assert code == 0
     summary = json.loads((output / "conversion_summary.json").read_text(encoding="utf-8"))
     assert summary["counts"] == {"tasks": 1, "accepted": 2, "skipped": 0, "failed": 0}
+    assert summary["action_mode"] == "both"
+    assert summary["task_language"] == "english"
     report_path = output / "289/date/close_fridge/conversion_report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["task_title"] == "close_fridge"
@@ -209,6 +292,354 @@ def test_preflight_natural_discovery_language_and_atomic_reports(tmp_path: Path,
         "episode_000002", "episode_000010",
     ]
     assert not list(output.rglob("*.tmp"))
+
+
+def test_include_episode_selects_exact_paths_and_reports_discovery_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    make_cleaned_episode(root, "date/task/episode_000001")
+    make_cleaned_episode(root, "date/task/episode_000002")
+    output = tmp_path / "lerobot"
+    monkeypatch.setattr("lightworkbench.validation.probe_video", lambda path, decoded=True: fake_probe(path))
+
+    code = cli.main([
+        "convert", "--input-root", str(root), "--output-root", str(output), "--preflight-only",
+        "--include-episode", "date/task/episode_000002",
+        "--video-codec", "h264", "--video-crf", "18", "--encoder-preset", "fast",
+        "--encoder-threads", "6", "--video-encoding-mode", "parallel",
+    ])
+
+    assert code == 0
+    summary = json.loads((output / "conversion_summary.json").read_text(encoding="utf-8"))
+    assert summary["discovered_episodes"] == 2
+    assert summary["selected_episodes"] == 1
+    assert summary["included_episodes"] == ["date/task/episode_000002"]
+    assert summary["encoder_config"] == {
+        "video_codec": "h264", "video_crf": 18, "encoder_preset": "fast",
+        "encoder_threads": 6, "video_encoding_mode": "parallel",
+    }
+    report = json.loads((output / "date/task/conversion_report.json").read_text(encoding="utf-8"))
+    assert [item["episode_id"] for item in report["accepted"]] == [2]
+
+
+@pytest.mark.parametrize(
+    "selectors",
+    [
+        ["date/task/episode_000001", "date/task/episode_000001"],
+        ["../episode_000001"],
+        ["date/task/episode_999999"],
+    ],
+)
+def test_include_episode_rejects_duplicate_unsafe_and_missing_paths(
+    tmp_path: Path, selectors: list[str],
+) -> None:
+    root = tmp_path / "cleaned"
+    make_cleaned_episode(root, "date/task/episode_000001")
+
+    code = cli.main([
+        "convert", "--input-root", str(root), "--output-root", str(tmp_path / "output"),
+        "--preflight-only", *[item for value in selectors for item in ("--include-episode", value)],
+    ])
+
+    assert code == 2
+
+
+def test_merged_preflight_defaults_below_input_and_accepts_tasks_with_duplicate_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    make_cleaned_episode(
+        root, "date/task_a/episode_000001", task_title="pick_the_tray",
+        description="拿起托盘",
+    )
+    make_cleaned_episode(
+        root, "date/task_b/episode_000001", task_title="close_fridge",
+        description="关闭冰箱",
+    )
+    monkeypatch.setattr("lightworkbench.validation.probe_video", lambda path, decoded=True: fake_probe(path))
+
+    code = cli.main(["convert-merged", "--input-root", str(root), "--preflight-only"])
+
+    output = root / "lerobot_data"
+    assert code == 0
+    summary = json.loads((output / "conversion_summary.json").read_text(encoding="utf-8"))
+    report = json.loads((output / "conversion_report.json").read_text(encoding="utf-8"))
+    assert summary["command"] == "convert-merged"
+    assert summary["output_root"] == str(output)
+    assert summary["counts"] == {"tasks": 2, "accepted": 2, "skipped": 0, "failed": 0}
+    assert [item["episode"] for item in report["accepted"]] == [
+        "date/task_a/episode_000001", "date/task_b/episode_000001",
+    ]
+    assert report["task_titles"] == ["close_fridge", "pick_the_tray"]
+    assert report["stored_tasks"] == ["close fridge", "pick the tray"]
+    assert {item["stored_task"] for item in report["accepted"]} == {"close fridge", "pick the tray"}
+    assert {item["episode_id"] for item in report["accepted"]} == {1}
+
+
+def test_merged_preflight_chooses_largest_training_schema_globally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    make_cleaned_episode(root, "group/task_a/episode_000001", task_title="task_a")
+    make_cleaned_episode(root, "group/task_b/episode_000002", task_title="task_b")
+    make_cleaned_episode(root, "group/schema_outlier/episode_000003", task_title="task_c")
+
+    def probe(path: Path) -> dict:
+        result = fake_probe(path)
+        if "schema_outlier" in path.parts:
+            result["width"] = 80
+        return result
+
+    monkeypatch.setattr("lightworkbench.validation.probe_video", lambda path, decoded=True: probe(path))
+    output = tmp_path / "merged"
+
+    code = cli.main([
+        "convert-merged", "--input-root", str(root), "--output-root", str(output),
+        "--preflight-only",
+    ])
+
+    assert code == 1
+    report = json.loads((output / "conversion_report.json").read_text(encoding="utf-8"))
+    assert [item["episode"] for item in report["accepted"]] == [
+        "group/task_a/episode_000001", "group/task_b/episode_000002",
+    ]
+    assert report["skipped"][0]["episode"] == "group/schema_outlier/episode_000003"
+    assert report["skipped"][0]["reasons"] == ["schema_outlier"]
+    assert report["schema"]["videos"]["rgbd_head_color"]["width"] == 64
+
+
+def test_merged_preflight_locks_schema_to_existing_owner_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    make_cleaned_episode(root, "group/current_a/episode_000001", task_title="task_a")
+    make_cleaned_episode(root, "group/current_b/episode_000002", task_title="task_b")
+    make_cleaned_episode(root, "group/stored_schema/episode_000003", task_title="task_c")
+
+    def probe(path: Path) -> dict:
+        result = fake_probe(path)
+        if "stored_schema" in path.parts:
+            result["width"] = 80
+        return result
+
+    monkeypatch.setattr("lightworkbench.validation.probe_video", lambda path, decoded=True: probe(path))
+    output = tmp_path / "merged"
+    owner = output / "whole_body_joint"
+    owner.mkdir(parents=True)
+    videos = {
+        name: {"width": 80, "height": 48, "is_depth": False}
+        for name in ("rgbd_head_color", "hand_left", "hand_right")
+    }
+    (owner / "conversion_state.json").write_text(json.dumps({
+        "version": 3,
+        "action_mode": "whole_body_joint",
+        "dataset_layout": "merged",
+        "conversion_config": {"action_dim": 23},
+        "schema": {"fps": 30, "videos": videos},
+    }), encoding="utf-8")
+
+    code = cli.main([
+        "convert-merged", "--input-root", str(root), "--output-root", str(output),
+        "--preflight-only", "--action-mode", "whole_body_joint",
+    ])
+
+    assert code == 1
+    report = json.loads((output / "conversion_report.json").read_text(encoding="utf-8"))
+    assert [item["episode"] for item in report["accepted"]] == [
+        "group/stored_schema/episode_000003",
+    ]
+    assert {item["episode"] for item in report["skipped"]} == {
+        "group/current_a/episode_000001", "group/current_b/episode_000002",
+    }
+    assert all(item["reasons"] == ["schema_outlier"] for item in report["skipped"])
+    assert report["schema"]["videos"]["rgbd_head_color"]["width"] == 80
+
+
+def test_merged_conversion_calls_engine_with_per_episode_tasks_and_reports_path_outcomes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    make_cleaned_episode(
+        root, "day/task_a/episode_000001", task_title="pick_the_egg_tart",
+    )
+    make_cleaned_episode(
+        root, "day/task_b/episode_000001", task_title="close_fridge",
+    )
+    output = tmp_path / "merged"
+    monkeypatch.setattr("lightworkbench.validation.probe_video", lambda path, decoded=True: fake_probe(path))
+    calls: dict[str, object] = {"loaded": []}
+
+    class Config:
+        def __init__(self, **kwargs) -> None:
+            self.values = kwargs
+
+    class Result:
+        action_mode = "both"
+        failed = ()
+
+        def __init__(self, ledger: dict) -> None:
+            self.ledger = ledger
+
+    class Engine:
+        ConverterConfig = Config
+
+        @staticmethod
+        def load_source_episode(path: Path, task: str) -> dict:
+            calls["loaded"].append((path, task))
+            return {"path": path, "task": task}
+
+        @staticmethod
+        def convert_merged_bundle(
+            sources: list[dict], bundle_root: Path, namespace: str, *,
+            source_root: Path, config: Config, action_mode: str,
+        ) -> Result:
+            calls["convert"] = {
+                "sources": sources,
+                "bundle_root": bundle_root,
+                "namespace": namespace,
+                "source_root": source_root,
+                "config": config.values,
+                "action_mode": action_mode,
+            }
+            paths = [source["path"].relative_to(source_root).as_posix() for source in sources]
+            outcomes = ("existing", "appended")
+            return Result({
+                "episodes": [
+                    {
+                        "source_relative_path": relative,
+                        "modes": {
+                            "whole_body_joint": {"status": "committed", "outcome": outcome},
+                            "body_joint_eef": {"status": "committed", "outcome": outcome},
+                        },
+                    }
+                    for relative, outcome in zip(paths, outcomes)
+                ],
+            })
+
+    monkeypatch.setattr(cli, "_engine_import", lambda: Engine)
+    code = cli.main([
+        "convert-merged", "--input-root", str(root), "--output-root", str(output),
+        "--namespace", "merged_test", "--video-codec", "h264",
+        "--encoder-threads", "4", "--video-encoding-mode", "parallel",
+    ])
+
+    assert code == 0
+    assert [(path.relative_to(root).as_posix(), task) for path, task in calls["loaded"]] == [
+        ("day/task_a/episode_000001", "pick the egg tart"),
+        ("day/task_b/episode_000001", "close fridge"),
+    ]
+    conversion = calls["convert"]
+    assert conversion["bundle_root"] == output
+    assert conversion["source_root"] == root
+    assert conversion["namespace"] == "merged_test"
+    assert conversion["action_mode"] == "both"
+    assert conversion["config"]["video_codec"] == "h264"
+    assert conversion["config"]["encoder_threads"] == 4
+    assert conversion["config"]["video_encoding_mode"] == "parallel"
+
+    report = json.loads((output / "conversion_report.json").read_text(encoding="utf-8"))
+    by_path = {item["episode"]: item for item in report["accepted"]}
+    assert all(item["source_relative_path"] == item["episode"] for item in report["accepted"])
+    assert by_path["day/task_a/episode_000001"]["conversion"]["modes"]["whole_body_joint"]["outcome"] == "existing"
+    assert by_path["day/task_b/episode_000001"]["conversion"]["modes"]["body_joint_eef"]["outcome"] == "appended"
+
+
+def test_merged_conversion_skips_one_source_load_failure_and_converts_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    make_cleaned_episode(root, "day/task/episode_000001")
+    make_cleaned_episode(root, "day/task/episode_000002")
+    output = tmp_path / "merged"
+    monkeypatch.setattr(
+        "lightworkbench.validation.probe_video",
+        lambda path, decoded=True: fake_probe(path),
+    )
+    converted_paths: list[str] = []
+
+    class Config:
+        def __init__(self, **kwargs) -> None:
+            self.values = kwargs
+
+    class Result:
+        action_mode = "both"
+        failed = ()
+
+        def __init__(self, ledger: dict) -> None:
+            self.ledger = ledger
+
+    class Engine:
+        ConverterConfig = Config
+
+        @staticmethod
+        def load_source_episode(path: Path, task: str) -> dict:
+            if path.name == "episode_000001":
+                raise ValueError("synthetic load failure")
+            return {"path": path, "task": task}
+
+        @staticmethod
+        def convert_merged_bundle(
+            sources: list[dict], bundle_root: Path, namespace: str, *,
+            source_root: Path, config: Config, action_mode: str,
+        ) -> Result:
+            del bundle_root, namespace, config, action_mode
+            converted_paths.extend(
+                source["path"].relative_to(source_root).as_posix() for source in sources
+            )
+            return Result({
+                "episodes": [
+                    {
+                        "source_relative_path": relative,
+                        "modes": {
+                            "whole_body_joint": {"status": "committed"},
+                            "body_joint_eef": {"status": "committed"},
+                        },
+                    }
+                    for relative in converted_paths
+                ],
+            })
+
+    monkeypatch.setattr(cli, "_engine_import", lambda: Engine)
+
+    code = cli.main([
+        "convert-merged", "--input-root", str(root), "--output-root", str(output),
+    ])
+
+    assert code == 1
+    assert converted_paths == ["day/task/episode_000002"]
+    report = json.loads((output / "conversion_report.json").read_text(encoding="utf-8"))
+    assert [item["episode"] for item in report["accepted"]] == [
+        "day/task/episode_000002",
+    ]
+    assert [(item["episode"], item["reasons"]) for item in report["skipped"]] == [
+        ("day/task/episode_000001", ["source_load_failed:synthetic load failure"]),
+    ]
+    assert report["failed"] == []
+    assert report["counts"] == {"tasks": 1, "accepted": 1, "skipped": 1, "failed": 0}
+
+
+def test_merged_include_episode_uses_the_shared_exact_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    make_cleaned_episode(root, "date/task_a/episode_000001", task_title="task_a")
+    make_cleaned_episode(root, "date/task_b/episode_000002", task_title="task_b")
+    output = tmp_path / "merged"
+    monkeypatch.setattr("lightworkbench.validation.probe_video", lambda path, decoded=True: fake_probe(path))
+
+    code = cli.main([
+        "convert-merged", "--input-root", str(root), "--output-root", str(output),
+        "--preflight-only", "--include-episode", "date/task_b/episode_000002",
+    ])
+
+    assert code == 0
+    summary = json.loads((output / "conversion_summary.json").read_text(encoding="utf-8"))
+    report = json.loads((output / "conversion_report.json").read_text(encoding="utf-8"))
+    assert summary["discovered_episodes"] == 2
+    assert summary["selected_episodes"] == 1
+    assert summary["included_episodes"] == ["date/task_b/episode_000002"]
+    assert [item["episode"] for item in report["accepted"]] == ["date/task_b/episode_000002"]
 
 
 def test_preflight_rejects_duplicate_episode_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -245,25 +676,45 @@ def test_preflight_rejects_legacy_action_state(tmp_path: Path, monkeypatch: pyte
     report = json.loads((task_output / "conversion_report.json").read_text(encoding="utf-8"))
 
     assert code == 1
-    assert report["skipped"][0]["reasons"] == ["incompatible_action_schema_requires_new_output_root"]
+    assert report["skipped"][0]["reasons"] == [
+        "incompatible_v2_20d_action_schema_requires_new_output_root"
+    ]
 
 
-def test_preflight_rejects_stored_task_language_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_training_task_is_fixed_to_normalized_english(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "cleaned"
-    make_cleaned_episode(root, "task/episode_000001")
-    task_output = tmp_path / "lerobot/task"
-    task_output.mkdir(parents=True)
-    (task_output / "conversion_state.json").write_text(
-        json.dumps({"version": 2, "conversion_config": {"action_dim": 20}, "stored_task": "close fridge"}),
-        encoding="utf-8",
+    make_cleaned_episode(
+        root, "task/episode_000001",
+        task_title="pick_the_egg_tart_from_tray", description="从托盘拿蛋挞",
     )
     monkeypatch.setattr("lightworkbench.validation.probe_video", lambda path, decoded=True: fake_probe(path))
 
-    code = cli.main(["convert", "--input-root", str(root), "--output-root", str(tmp_path / "lerobot"), "--preflight-only", "--task-language", "source"])
-    report = json.loads((task_output / "conversion_report.json").read_text(encoding="utf-8"))
+    output = tmp_path / "lerobot"
+    code = cli.main([
+        "convert", "--input-root", str(root), "--output-root", str(output), "--preflight-only",
+    ])
+    report = json.loads((output / "task/conversion_report.json").read_text(encoding="utf-8"))
+
+    assert code == 0
+    assert report["stored_task"] == "pick the egg tart from tray"
+    assert report["source_description"] == "从托盘拿蛋挞"
+    assert report["task_language"] == "english"
+
+
+def test_body_only_preflight_requires_existing_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "cleaned"
+    make_cleaned_episode(root, "task/episode_000001")
+    output = tmp_path / "lerobot"
+    monkeypatch.setattr("lightworkbench.validation.probe_video", lambda path, decoded=True: fake_probe(path))
+
+    code = cli.main([
+        "convert", "--input-root", str(root), "--output-root", str(output),
+        "--preflight-only", "--action-mode", "body_joint_eef",
+    ])
+    report = json.loads((output / "task/conversion_report.json").read_text(encoding="utf-8"))
 
     assert code == 1
-    assert report["skipped"][0]["reasons"] == ["stored_task_language_or_text_conflict"]
+    assert report["skipped"][0]["reasons"] == ["body_joint_eef_requires_video_owner_use_both"]
 
 
 def test_missing_optional_dependency_is_reported_and_other_tasks_continue(
