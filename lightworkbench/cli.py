@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import tempfile
+import uuid
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, is_dataclass
@@ -14,6 +15,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .config import RESOURCES
+from .frame_id_repair import (
+    audit_frame_id_target,
+    has_frame_id_mismatch,
+    repair_frame_ids,
+)
 from .validation import (
     EPISODE_RE,
     REQUIRED_COLOR_STREAMS,
@@ -235,10 +241,24 @@ def _validate_episodes(
     *,
     require_source: bool,
     requested_workers: int,
-) -> tuple[list[EpisodeValidation], int]:
+    auto_repair_frame_ids: bool = True,
+    repair_backup_root: Path | None = None,
+) -> tuple[list[EpisodeValidation], int, dict[str, Any]]:
+    repair_summary: dict[str, Any] = {
+        "enabled": auto_repair_frame_ids,
+        "scope": "selected_input",
+        "candidates": 0,
+        "eligible": 0,
+        "repaired": 0,
+        "resolved_concurrently": 0,
+        "frames": 0,
+        "frame_ids_changed": 0,
+        "backup_path": None,
+        "failures": [],
+    }
     total = len(episodes)
     if total == 0:
-        return [], 0
+        return [], 0, repair_summary
     workers = min(total, max(1, requested_workers), max(1, int(RESOURCES["budget"])))
     print(f"preflight: validating {total} Episodes with {workers} workers", file=sys.stderr, flush=True)
 
@@ -263,7 +283,150 @@ def _validate_episodes(
             for future in futures:
                 future.cancel()
             raise
-    return [checked[index] for index in range(total)], workers
+    ordered = [checked[index] for index in range(total)]
+    if not auto_repair_frame_ids:
+        return ordered, workers, repair_summary
+
+    candidate_indices = [
+        index
+        for index, item in enumerate(ordered)
+        if item.reasons and all(has_frame_id_mismatch([reason]) for reason in item.reasons)
+    ]
+    repair_summary["candidates"] = len(candidate_indices)
+    eligible_indices: list[int] = []
+    already_correct_indices: list[int] = []
+    for index in candidate_indices:
+        item = ordered[index]
+        try:
+            audit = audit_frame_id_target(input_root, item.relative_path)
+        except (OSError, ValueError) as exc:
+            item.warnings.append(f"video_frame_ids_auto_repair_ineligible:{type(exc).__name__}")
+            print(
+                f"preflight: frame-id auto-repair ineligible: {item.relative_path}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            repair_summary["failures"].append({
+                "episode": item.relative_path,
+                "stage": "eligibility",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            continue
+        if audit.frame_ids_to_change:
+            eligible_indices.append(index)
+        else:
+            already_correct_indices.append(index)
+    repair_summary["eligible"] = len(eligible_indices)
+    repair_summary["resolved_concurrently"] = len(already_correct_indices)
+
+    def revalidate(
+        indices: Sequence[int],
+        *,
+        resolved_warning: str,
+        unresolved_warning: str,
+    ) -> list[int]:
+        still_invalid: list[int] = []
+        if not indices:
+            return still_invalid
+        with ThreadPoolExecutor(max_workers=min(workers, len(indices))) as pool:
+            futures = {
+                pool.submit(
+                    validate_episode,
+                    input_root,
+                    ordered[index].path,
+                    require_source=require_source,
+                ): index
+                for index in indices
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                result = future.result()
+                if has_frame_id_mismatch(result.reasons):
+                    result.warnings.append(unresolved_warning)
+                    still_invalid.append(index)
+                else:
+                    result.warnings.append(resolved_warning)
+                ordered[index] = result
+        return still_invalid
+
+    # Another conversion process may have repaired an Episode after our first validation.
+    revalidate(
+        already_correct_indices,
+        resolved_warning="video_frame_ids_already_repaired_concurrently",
+        unresolved_warning="video_frame_ids_concurrent_recheck_failed",
+    )
+    if not eligible_indices:
+        return ordered, workers, repair_summary
+
+    backup_root = (repair_backup_root or input_root / ".lightworkbench-frame-id-backups").resolve()
+    backup_path = backup_root / (
+        f"frame-id-auto-repair-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-"
+        f"{uuid.uuid4().hex}.zip"
+    )
+    relative_targets = [ordered[index].relative_path for index in eligible_indices]
+    try:
+        repaired = repair_frame_ids(
+            input_root,
+            relative_targets,
+            backup_path,
+            source_label="automatic LeRobot preflight repair",
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"preflight: frame-id auto-repair failed: {exc}", file=sys.stderr, flush=True)
+        still_invalid = revalidate(
+            eligible_indices,
+            resolved_warning="video_frame_ids_already_repaired_concurrently",
+            unresolved_warning=f"video_frame_ids_auto_repair_failed:{type(exc).__name__}",
+        )
+        concurrently_repaired = len(eligible_indices) - len(still_invalid)
+        repair_summary["resolved_concurrently"] += concurrently_repaired
+        if backup_path.is_file():
+            repair_summary["backup_path"] = str(backup_path)
+        for index in still_invalid:
+            repair_summary["failures"].append({
+                "episode": ordered[index].relative_path,
+                "stage": "repair",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+        return ordered, workers, repair_summary
+
+    print(
+        f"preflight: auto-repaired {repaired.episodes} Episodes / "
+        f"{repaired.frame_ids_changed} video frame IDs; "
+        f"already correct: {len(repaired.already_correct_targets)}; "
+        f"backup: {repaired.backup_path}",
+        file=sys.stderr,
+        flush=True,
+    )
+    repair_summary.update({
+        "repaired": repaired.episodes,
+        "frames": repaired.frames,
+        "frame_ids_changed": repaired.frame_ids_changed,
+        "backup_path": str(repaired.backup_path) if repaired.backup_path is not None else None,
+    })
+    repair_summary["resolved_concurrently"] += len(repaired.already_correct_targets)
+    indices_by_relative = {ordered[index].relative_path: index for index in eligible_indices}
+    repaired_indices = [indices_by_relative[relative] for relative in repaired.repaired_targets]
+    concurrent_indices = [
+        indices_by_relative[relative] for relative in repaired.already_correct_targets
+    ]
+    still_invalid = revalidate(
+        repaired_indices,
+        resolved_warning="video_frame_ids_auto_repaired",
+        unresolved_warning="video_frame_ids_auto_repair_post_validation_failed",
+    )
+    still_invalid.extend(revalidate(
+        concurrent_indices,
+        resolved_warning="video_frame_ids_already_repaired_concurrently",
+        unresolved_warning="video_frame_ids_concurrent_recheck_failed",
+    ))
+    for index in still_invalid:
+        repair_summary["failures"].append({
+            "episode": ordered[index].relative_path,
+            "stage": "post_repair_validation",
+            "error": "video frame-id mismatch remains after repair",
+        })
+    return ordered, workers, repair_summary
 
 
 def _conversion_payload(value: object) -> Any:
@@ -295,6 +458,8 @@ def _report(
     accepted: list[dict[str, Any]],
     skipped: list[dict[str, Any]],
     failed: list[dict[str, Any]],
+    auto_repair_frame_ids: bool,
+    frame_id_auto_repair: dict[str, Any],
     conversion: Any = None,
 ) -> dict[str, Any]:
     warnings = sorted({warning for item in accepted + skipped for warning in item.get("warnings", [])})
@@ -308,6 +473,8 @@ def _report(
         "task_language": "english",
         "action_mode": action_mode,
         "encoder_config": encoder_config,
+        "auto_repair_frame_ids": auto_repair_frame_ids,
+        "frame_id_auto_repair": frame_id_auto_repair,
         "task_title": task_title,
         "source_description": source_description,
         "stored_task": stored_task,
@@ -595,11 +762,13 @@ def convert(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    checked_episodes, preflight_workers = _validate_episodes(
+    checked_episodes, preflight_workers, frame_id_auto_repair = _validate_episodes(
         input_root,
         discovered,
         require_source=args.require_source,
         requested_workers=args.preflight_workers,
+        auto_repair_frame_ids=args.auto_repair_frame_ids,
+        repair_backup_root=output_root / ".preflight-frame-id-backups",
     )
     grouped: OrderedDict[str, list[EpisodeValidation]] = OrderedDict()
     for checked in checked_episodes:
@@ -702,6 +871,8 @@ def convert(args: argparse.Namespace) -> int:
             accepted=accepted_reports,
             skipped=skipped_reports,
             failed=failed_reports,
+            auto_repair_frame_ids=args.auto_repair_frame_ids,
+            frame_id_auto_repair=frame_id_auto_repair,
             conversion=conversion_result,
         )
         _atomic_json(report_output / REPORT_NAME, report)
@@ -720,6 +891,8 @@ def convert(args: argparse.Namespace) -> int:
         "action_mode": args.action_mode,
         "encoder_config": encoder_config,
         "preflight_workers": preflight_workers,
+        "auto_repair_frame_ids": args.auto_repair_frame_ids,
+        "frame_id_auto_repair": frame_id_auto_repair,
         "require_source": bool(args.require_source),
         "discovered_episodes": len(discovered_all),
         "selected_episodes": len(discovered),
@@ -792,11 +965,13 @@ def convert_merged(args: argparse.Namespace) -> int:
         return 2
     output_root.mkdir(parents=True, exist_ok=True)
 
-    checked_episodes, preflight_workers = _validate_episodes(
+    checked_episodes, preflight_workers, frame_id_auto_repair = _validate_episodes(
         input_root,
         discovered,
         require_source=args.require_source,
         requested_workers=args.preflight_workers,
+        auto_repair_frame_ids=args.auto_repair_frame_ids,
+        repair_backup_root=output_root / ".preflight-frame-id-backups",
     )
     checked_episodes.sort(key=lambda item: natural_key(item.relative_path))
     valid = [item for item in checked_episodes if item.valid]
@@ -869,6 +1044,8 @@ def convert_merged(args: argparse.Namespace) -> int:
         "action_mode": args.action_mode,
         "encoder_config": encoder_config,
         "preflight_workers": preflight_workers,
+        "auto_repair_frame_ids": args.auto_repair_frame_ids,
+        "frame_id_auto_repair": frame_id_auto_repair,
         "require_source": bool(args.require_source),
         "preflight_only": bool(args.preflight_only),
         "discovered_episodes": len(discovered_all),
@@ -906,6 +1083,8 @@ def convert_merged(args: argparse.Namespace) -> int:
         "action_mode": args.action_mode,
         "encoder_config": encoder_config,
         "preflight_workers": preflight_workers,
+        "auto_repair_frame_ids": args.auto_repair_frame_ids,
+        "frame_id_auto_repair": frame_id_auto_repair,
         "require_source": bool(args.require_source),
         "discovered_episodes": len(discovered_all),
         "selected_episodes": len(discovered),
@@ -962,6 +1141,12 @@ def _add_conversion_arguments(command: argparse.ArgumentParser, *, output_requir
     command.add_argument(
         "--preflight-workers", type=_positive_int, default=max(1, int(RESOURCES["budget"])),
         help="parallel Episode validators (default: CPU budget; capped by the CPU budget)",
+    )
+    command.add_argument(
+        "--no-auto-repair-frame-ids",
+        action="store_false",
+        dest="auto_repair_frame_ids",
+        help="report legacy no_trim video frame IDs without repairing the cleaned Episode",
     )
     command.add_argument(
         "--action-mode", choices=("both", *ACTION_MODES), default="both",

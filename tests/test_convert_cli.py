@@ -125,6 +125,27 @@ def refresh_audit_fingerprint(episode: Path) -> None:
     path.write_text(json.dumps(audit), encoding="utf-8")
 
 
+def set_legacy_global_video_frame_ids(episode: Path, *, aborted: bool = False) -> None:
+    manifest = episode / "manifest.jsonl"
+    rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    frame_index = 0
+    for row in rows:
+        if isinstance(row.get("_type"), str):
+            continue
+        for stream_index, entry in enumerate(row["videos"].values()):
+            entry["frame_id"] = 10_000 * (stream_index + 1) + frame_index
+            entry["is_repeat"] = False
+            entry["frames_dropped"] = 0
+        frame_index += 1
+    if aborted:
+        rows.append({"_type": "session_footer", "aborted": True, "reason": "FAILURE"})
+    manifest.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    refresh_audit_fingerprint(episode)
+
+
 def test_parallel_preflight_is_bounded_and_preserves_input_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -156,7 +177,7 @@ def test_parallel_preflight_is_bounded_and_preserves_input_order(
     monkeypatch.setattr(cli, "validate_episode", fake_validate)
     monkeypatch.setitem(cli.RESOURCES, "budget", 2)
 
-    checked, workers = cli._validate_episodes(
+    checked, workers, repair_summary = cli._validate_episodes(
         tmp_path,
         paths,
         require_source=True,
@@ -167,6 +188,18 @@ def test_parallel_preflight_is_bounded_and_preserves_input_order(
     assert max_active == 2
     assert require_source_values == [True] * len(paths)
     assert [item.path for item in checked] == paths
+    assert repair_summary == {
+        "enabled": True,
+        "scope": "selected_input",
+        "candidates": 0,
+        "eligible": 0,
+        "repaired": 0,
+        "resolved_concurrently": 0,
+        "frames": 0,
+        "frame_ids_changed": 0,
+        "backup_path": None,
+        "failures": [],
+    }
 
 
 def test_strict_validation_fingerprint_control_mask_and_source_policy(tmp_path: Path) -> None:
@@ -251,6 +284,260 @@ def test_merged_preflight_skips_aborted_session_footer(
         ("day/task/episode_000001", ["manifest_session_aborted"]),
     ]
     assert report["failed"] == []
+
+
+@pytest.mark.parametrize("command", ["convert", "convert-merged"])
+def test_preflight_auto_repairs_legacy_no_trim_frame_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str,
+) -> None:
+    root = tmp_path / "cleaned"
+    episode = make_cleaned_episode(root, "day/task/episode_000001")
+    set_legacy_global_video_frame_ids(episode)
+    output = tmp_path / "lerobot"
+    monkeypatch.setattr(
+        "lightworkbench.validation.probe_video",
+        lambda path, decoded=True: fake_probe(path),
+    )
+
+    code = cli.main([
+        command, "--input-root", str(root), "--output-root", str(output),
+        "--preflight-only",
+    ])
+
+    assert code == 0
+    rows = [json.loads(line) for line in (episode / "manifest.jsonl").read_text().splitlines()]
+    frames = [row for row in rows if not isinstance(row.get("_type"), str)]
+    assert all(
+        entry["frame_id"] == frame_index
+        for frame_index, row in enumerate(frames)
+        for entry in row["videos"].values()
+    )
+    cut_info = json.loads((episode / "CUT_INFO.json").read_text())
+    assert cut_info["repairs"][-1]["type"] == "video_frame_id_reindex"
+    assert cut_info["outputFingerprint"] == output_fingerprint(episode)
+    backups = list((output / ".preflight-frame-id-backups").glob("*.zip"))
+    assert len(backups) == 1
+    reports = list(output.rglob("conversion_report.json"))
+    assert len(reports) == 1
+    report = json.loads(reports[0].read_text())
+    assert report["counts"]["accepted"] == 1
+    assert "video_frame_ids_auto_repaired" in report["accepted"][0]["warnings"]
+    repair = report["frame_id_auto_repair"]
+    assert repair["candidates"] == repair["eligible"] == repair["repaired"] == 1
+    assert repair["frames"] == 3
+    assert repair["frame_ids_changed"] == 12
+    assert repair["backup_path"] == str(backups[0])
+    assert repair["failures"] == []
+    summary = json.loads((output / "conversion_summary.json").read_text())
+    assert summary["frame_id_auto_repair"] == repair
+
+
+def test_preflight_frame_id_auto_repair_can_be_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    episode = make_cleaned_episode(root, "day/task/episode_000001")
+    set_legacy_global_video_frame_ids(episode)
+    output = tmp_path / "lerobot"
+    monkeypatch.setattr(
+        "lightworkbench.validation.probe_video",
+        lambda path, decoded=True: fake_probe(path),
+    )
+
+    code = cli.main([
+        "convert-merged", "--input-root", str(root), "--output-root", str(output),
+        "--preflight-only", "--no-auto-repair-frame-ids",
+    ])
+
+    assert code == 1
+    report = json.loads((output / "conversion_report.json").read_text())
+    assert report["counts"]["skipped"] == 1
+    assert "video_frame_id_mismatch:hand_left:0" in report["skipped"][0]["reasons"]
+    assert report["frame_id_auto_repair"]["enabled"] is False
+    assert report["frame_id_auto_repair"]["candidates"] == 0
+    assert not list((output / ".preflight-frame-id-backups").glob("*.zip"))
+
+
+def test_preflight_rechecks_when_another_process_repairs_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    episode = make_cleaned_episode(root, "day/task/episode_000001")
+    set_legacy_global_video_frame_ids(episode)
+    output = tmp_path / "lerobot"
+    monkeypatch.setattr(
+        "lightworkbench.validation.probe_video",
+        lambda path, decoded=True: fake_probe(path),
+    )
+
+    def repaired_by_other_process(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        manifest = episode / "manifest.jsonl"
+        rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+        frame_index = 0
+        for row in rows:
+            if isinstance(row.get("_type"), str):
+                continue
+            for entry in row["videos"].values():
+                entry["frame_id"] = frame_index
+            frame_index += 1
+        manifest.write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        refresh_audit_fingerprint(episode)
+        raise ValueError("selected Episode already has local frame IDs")
+
+    monkeypatch.setattr(cli, "repair_frame_ids", repaired_by_other_process)
+
+    code = cli.main([
+        "convert-merged", "--input-root", str(root), "--output-root", str(output),
+        "--preflight-only",
+    ])
+
+    assert code == 0
+    report = json.loads((output / "conversion_report.json").read_text())
+    assert report["counts"]["accepted"] == 1
+    assert "video_frame_ids_already_repaired_concurrently" in report["accepted"][0]["warnings"]
+    repair = report["frame_id_auto_repair"]
+    assert repair["candidates"] == repair["eligible"] == repair["resolved_concurrently"] == 1
+    assert repair["repaired"] == 0
+    assert repair["failures"] == []
+
+
+def test_preflight_repairs_nonoverlapping_remainder_after_concurrent_partial_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    first = make_cleaned_episode(root, "day/task/episode_000001")
+    second = make_cleaned_episode(root, "day/task/episode_000002")
+    set_legacy_global_video_frame_ids(first)
+    set_legacy_global_video_frame_ids(second)
+    output = tmp_path / "lerobot"
+    monkeypatch.setattr(
+        "lightworkbench.validation.probe_video",
+        lambda path, decoded=True: fake_probe(path),
+    )
+    original_repair = cli.repair_frame_ids
+    injected = False
+
+    def partially_repaired_by_other_process(
+        raw_root: Path,
+        relative_targets: list[str],
+        backup_path: Path,
+        *,
+        source_label: str,
+    ) -> object:
+        nonlocal injected
+        if not injected:
+            injected = True
+            original_repair(
+                raw_root,
+                [relative_targets[0]],
+                tmp_path / "other-process-backup.zip",
+                source_label="simulated concurrent process",
+            )
+        return original_repair(
+            raw_root,
+            relative_targets,
+            backup_path,
+            source_label=source_label,
+        )
+
+    monkeypatch.setattr(cli, "repair_frame_ids", partially_repaired_by_other_process)
+
+    code = cli.main([
+        "convert-merged", "--input-root", str(root), "--output-root", str(output),
+        "--preflight-only",
+    ])
+
+    assert code == 0
+    report = json.loads((output / "conversion_report.json").read_text())
+    assert report["counts"]["accepted"] == 2
+    repair = report["frame_id_auto_repair"]
+    assert repair["candidates"] == repair["eligible"] == 2
+    assert repair["repaired"] == repair["resolved_concurrently"] == 1
+    assert repair["frame_ids_changed"] == 12
+    assert repair["failures"] == []
+    warnings = {item["episode"]: item["warnings"] for item in report["accepted"]}
+    assert "video_frame_ids_already_repaired_concurrently" in warnings[
+        "day/task/episode_000001"
+    ]
+    assert "video_frame_ids_auto_repaired" in warnings["day/task/episode_000002"]
+
+
+def test_preflight_repairs_first_frame_zero_with_later_dropped_frame_offset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    episode = make_cleaned_episode(root, "day/task/episode_000001")
+    manifest = episode / "manifest.jsonl"
+    rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    frame_index = 0
+    legacy_ids = (0, 2, 3)
+    for row in rows:
+        if isinstance(row.get("_type"), str):
+            continue
+        for entry in row["videos"].values():
+            entry["frame_id"] = legacy_ids[frame_index]
+            entry["is_repeat"] = False
+            entry["frames_dropped"] = 1 if frame_index == 1 else 0
+        frame_index += 1
+    manifest.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    refresh_audit_fingerprint(episode)
+    output = tmp_path / "lerobot"
+    monkeypatch.setattr(
+        "lightworkbench.validation.probe_video",
+        lambda path, decoded=True: fake_probe(path),
+    )
+
+    code = cli.main([
+        "convert-merged", "--input-root", str(root), "--output-root", str(output),
+        "--preflight-only",
+    ])
+
+    assert code == 0
+    report = json.loads((output / "conversion_report.json").read_text())
+    assert report["frame_id_auto_repair"]["frame_ids_changed"] == 8
+    repaired_rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+    frame_rows = [row for row in repaired_rows if not isinstance(row.get("_type"), str)]
+    assert all(
+        entry["frame_id"] == frame_index
+        for frame_index, row in enumerate(frame_rows)
+        for entry in row["videos"].values()
+    )
+
+
+def test_preflight_does_not_auto_repair_frame_ids_with_aborted_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    episode = make_cleaned_episode(root, "day/task/episode_000001")
+    set_legacy_global_video_frame_ids(episode, aborted=True)
+    output = tmp_path / "lerobot"
+    monkeypatch.setattr(
+        "lightworkbench.validation.probe_video",
+        lambda path, decoded=True: fake_probe(path),
+    )
+
+    code = cli.main([
+        "convert-merged", "--input-root", str(root), "--output-root", str(output),
+        "--preflight-only",
+    ])
+
+    assert code == 1
+    report = json.loads((output / "conversion_report.json").read_text())
+    assert set(report["skipped"][0]["reasons"]) == {
+        "manifest_session_aborted",
+        "video_frame_id_mismatch:hand_left:0",
+        "video_frame_id_mismatch:hand_right:0",
+        "video_frame_id_mismatch:rgbd_head_color:0",
+        "video_frame_id_mismatch:rgbd_head_depth:0",
+    }
+    assert "repairs" not in json.loads((episode / "CUT_INFO.json").read_text())
 
 
 def test_rejects_unverified_nested_timestamp_stitching(tmp_path: Path) -> None:

@@ -84,13 +84,44 @@ python -m pip install --index-url https://download.pytorch.org/whl/cpu \
 python -m pip install -e '.[lerobot]'
 ```
 
-可选依赖将 LeRobot 固定在 commit `adccdea1cfbec83ed98263feb7e59f7d047c5692`。也可在先安装 CPU Torch 后使用 `requirements-lerobot.txt` 安装相同环境。先运行只读预检：
+可选依赖将 LeRobot 固定在 commit `adccdea1cfbec83ed98263feb7e59f7d047c5692`。也可在先安装 CPU Torch 后使用 `requirements-lerobot.txt` 安装相同环境。先运行预检：
 
 ```bash
 data-autopro-light convert \
   --input-root /path/to/cleaned \
   --output-root /path/to/lerobot \
   --preflight-only
+```
+
+预检默认自动修复唯一错误为 `video_frame_id_mismatch` 的旧 `no_trim` Episode，修复前
+在输出根的 `.preflight-frame-id-backups/` 创建 ZIP 备份，修复后只重新验证命中的
+Episode。混有 aborted、指纹异常或其他错误的数据不会自动修改。需要严格只读预检时
+增加 `--no-auto-repair-frame-ids`。转换报告和总 summary 的 `frame_id_auto_repair`
+字段会记录候选/修复数量、帧数、修改 ID 数、备份路径和失败详情，便于审计与恢复。
+其中 `scope: selected_input` 表示普通 `convert` 的每个 task 报告引用的是本次所选输入的
+全局修复批次；总 summary 使用同一口径。
+
+旧版 `no_trim` 输出可能保留采集设备的全局视频 `frame_id`，从而在预检中出现
+`video_frame_id_mismatch`。通常由上述自动修复处理；也可根据已有转换报告使用独立工具
+先执行只读检查。下面假设报告中有 95 个目标；实际使用时将 95 替换为预期数量：
+
+```bash
+PYTHONPATH=. python scripts/repair_video_frame_ids.py \
+  --report /path/to/lerobot/conversion_report.json \
+  --raw-root /path/to/cleaned \
+  --expected-count 95
+```
+
+确认 Episode、帧数和待修改 ID 数量后，显式增加 `--apply` 和一个不存在的 ZIP
+备份路径。工具只重排非空视频引用的 `frame_id`，不改时间戳或丢帧字段，并同步
+更新 `CUT_INFO.json` 的审计指纹：
+
+```bash
+PYTHONPATH=. python scripts/repair_video_frame_ids.py \
+  --report /path/to/lerobot/conversion_report.json \
+  --raw-root /path/to/cleaned \
+  --expected-count 95 --apply \
+  --backup /path/to/backups/frame-id-repair.zip
 ```
 
 确认报告后去掉 `--preflight-only` 执行转换。默认 `--action-mode both` 从同一批 cleaned Episode 生成两套数据：
