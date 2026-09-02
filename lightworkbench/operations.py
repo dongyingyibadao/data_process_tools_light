@@ -6,6 +6,7 @@ import math
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import uuid
 from collections import deque
@@ -21,12 +22,12 @@ from .core import (
     EpisodeService,
     WorkbenchError,
     normalize_root,
-    probe_video,
     read_manifest,
     resolve_episode,
     resolve_video,
     source_token,
 )
+from .validation import validate_episode
 
 
 CSV_NAME = "CUT_HISTORY.csv"
@@ -38,6 +39,7 @@ CSV_FIELDS = [
 FINGERPRINT_VERSION = "sha256-relative-path-size-mtime-ns-v1"
 FINGERPRINT_EXCLUDES = ("CUT_INFO.json",)
 TIMESTAMP_REWRITE_VERSION = 2
+MANIFEST_NORMALIZATION_VERSION = 1
 
 
 class QueueFullError(WorkbenchError):
@@ -244,6 +246,47 @@ def rewrite_manifest(source: Path, destination: Path, keep: set[int], fps: float
                 output_index += 1
             source_index += 1
     return output_index
+
+
+def normalize_manifest_frame_ids(path: Path) -> int:
+    """Normalize Episode-local frame indices without changing other manifest values."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    frame_index = 0
+    try:
+        with path.open("r", encoding="utf-8", errors="strict") as source, os.fdopen(
+            descriptor, "w", encoding="utf-8"
+        ) as destination:
+            descriptor = -1
+            for line in source:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise WorkbenchError("manifest 行不是对象")
+                if not isinstance(row.get("_type"), str):
+                    row["frame_idx"] = frame_index
+                    videos = row.get("videos")
+                    if isinstance(videos, dict):
+                        for entry in videos.values():
+                            if isinstance(entry, dict):
+                                entry["frame_id"] = frame_index
+                    frame_index += 1
+                json.dump(row, destination, ensure_ascii=False, separators=(",", ":"))
+                destination.write("\n")
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary, path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise WorkbenchError("no_trim manifest 帧编号标准化失败") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary.exists():
+            temporary.unlink()
+    return frame_index
 
 
 def output_fingerprint(path: Path) -> str:
@@ -528,7 +571,7 @@ class OperationManager:
         if destination.exists() and not overwrite:
             raise ConflictError(f"目标已存在，需要确认覆盖: {destination}")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        staging_root = output_root / ".lightworkbench-staging" / state.id
+        staging_root = output_root.parent / f".{output_root.name}.lightworkbench-staging-{state.id}"
         staging = staging_root / relative
         staging.mkdir(parents=True, exist_ok=False)
         overwritten_id = ""
@@ -555,6 +598,11 @@ class OperationManager:
                 self._update(state, 0.18, "正在复制 Episode")
                 shutil.rmtree(staging)
                 shutil.copytree(episode, staging, symlinks=False)
+                written = normalize_manifest_frame_ids(staging / "manifest.jsonl")
+                if written != output_frames:
+                    raise WorkbenchError("no_trim manifest 输出帧数不一致")
+                audit["manifestNormalizationVersion"] = MANIFEST_NORMALIZATION_VERSION
+                audit["normalizedFields"] = ["frame_idx", "videos.*.frame_id"]
             else:
                 self._update(state, 0.12, "正在并行剪切全部视频")
                 streams = detail["streams"]
@@ -581,14 +629,7 @@ class OperationManager:
                 if written != output_frames:
                     raise WorkbenchError("manifest 输出帧数不一致")
 
-            self._update(state, 0.68, "正在复验输出")
-            output_meta = read_manifest(staging)
-            if output_meta.errors or output_meta.frame_count != output_frames:
-                raise WorkbenchError("输出 manifest 复验失败")
-            for name, relative_video in output_meta.stream_paths.items():
-                checked = probe_video(resolve_video(staging, relative_video), decoded=True)
-                if not checked.get("valid") or checked.get("frames") != output_frames:
-                    raise WorkbenchError(f"{name} 输出逐帧复验失败")
+            self._update(state, 0.68, "正在确认源数据状态")
             current = source_token(episode, read_manifest(episode).stream_paths)
             if current != expected:
                 raise ConflictError("处理期间源数据发生变化，未发布输出")
@@ -597,6 +638,11 @@ class OperationManager:
             audit["completedAtUtc"] = completed_at
             audit["outputFingerprint"] = output_fingerprint(staging)
             (staging / "CUT_INFO.json").write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            self._update(state, 0.84, "正在执行转换预检")
+            preflight = validate_episode(staging_root, staging, require_source=False)
+            if not preflight.valid:
+                reasons = "; ".join(preflight.reasons[:8])
+                raise WorkbenchError(f"转换预检未通过: {reasons}")
             self._update(state, 0.88, "正在原子发布")
             backup: Path | None = None
             backup_root: Path | None = None

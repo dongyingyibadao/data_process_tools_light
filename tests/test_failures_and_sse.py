@@ -65,7 +65,7 @@ def test_overwrite_publish_failure_restores_old_output(tmp_path: Path) -> None:
 
     def failing_publish(source, target):
         source_path, target_path = Path(source), Path(target)
-        if ".lightworkbench-staging" in source_path.parts and target_path == destination:
+        if any(".lightworkbench-staging-" in part for part in source_path.parts) and target_path == destination:
             raise OSError("injected publish failure")
         return real_replace(source, target)
 

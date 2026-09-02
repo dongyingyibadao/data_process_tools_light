@@ -97,7 +97,7 @@ def test_complete_browser_workflow_and_idle_network(tmp_path: Path) -> None:
             expect(page.locator("#itemCount")).to_have_text("129")
             assert page.locator(".episode-row").count() <= 30
             page.get_by_role("button", name="episode_000001", exact=False).click()
-            expect(page.locator("#validationBadge")).to_have_text("3 路同步有效")
+            expect(page.locator("#validationBadge")).to_have_text("4 路同步有效")
             expect(page.locator("#video")).to_have_count(1)
 
             rapid_switch = page.evaluate("""async () => {
@@ -125,7 +125,7 @@ def test_complete_browser_workflow_and_idle_network(tmp_path: Path) -> None:
             expect(page.locator("#episodeName")).to_have_text("episode_000002")
             page.evaluate("openEpisode('289/2026-08-30/task/episode_000001')")
             expect(page.locator("#episodeName")).to_have_text("episode_000001")
-            expect(page.locator("#validationBadge")).to_have_text("3 路同步有效")
+            expect(page.locator("#validationBadge")).to_have_text("4 路同步有效")
 
             queue_regression = page.evaluate("""async ({queueOutput, mainOutput}) => {
                 await api("/api/operations/settings", {
@@ -153,11 +153,11 @@ def test_complete_browser_workflow_and_idle_network(tmp_path: Path) -> None:
             event_requests = [url for url in api_requests if url.endswith("/api/operations/events")]
             assert len(event_requests) == 1
             assert not [url for url in api_requests if "/api/operations/" in url and url.endswith("/events") and not url.endswith("/operations/events")]
-            expect(page.locator("#validationBadge")).to_have_text("3 路同步有效")
+            expect(page.locator("#validationBadge")).to_have_text("4 路同步有效")
             expect(page.locator("#video")).to_have_attribute("src", re.compile("episode_000002"))
 
             page.evaluate("openEpisode('289/2026-08-30/task/episode_000001')")
-            expect(page.locator("#validationBadge")).to_have_text("3 路同步有效")
+            expect(page.locator("#validationBadge")).to_have_text("4 路同步有效")
             page.get_by_role("button", name="rgbd_head_color", exact=True).click()
             expect(page.locator("button.stream-tab.active")).to_have_text("rgbd_head_color")
             track = page.locator("#rangeTrack")

@@ -16,6 +16,7 @@ from lightworkbench.app import app, browse_service
 from lightworkbench.config import RESOURCES
 from lightworkbench.core import BrowseService, WorkbenchError, probe_video
 from lightworkbench.operations import normalize_ranges
+from lightworkbench.validation import validate_episode
 
 
 client = TestClient(app)
@@ -27,7 +28,7 @@ def make_episode(root: Path, relative: str = "289/2026-08-30/task/episode_000001
     episode.mkdir(parents=True)
     streams = {
         name: f"videos/{name}/episode_000001.mp4"
-        for name in ("hand_right", "head_right", "rgbd_head_color")
+        for name in ("hand_left", "hand_right", "head_right", "rgbd_head_color")
     }
     for index, path_value in enumerate(streams.values()):
         target = episode / path_value
@@ -38,7 +39,13 @@ def make_episode(root: Path, relative: str = "289/2026-08-30/task/episode_000001
             "-vf", f"hue=h={index * 40}", "-frames:v", str(frames), "-c:v", "libx264",
             "-pix_fmt", "yuv420p", str(target),
         ], check=True)
-    rows = [{"_type": "session_header", "fps_target": fps, "task_description": "抓取零件"}]
+    episode_id = int(episode.name.split("_")[-1])
+    task_title = "pick_part"
+    pose = {"position": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0]}
+    rows = [{
+        "_type": "session_header", "fps_target": fps, "episode_id": episode_id,
+        "task_title": task_title, "task_description": "抓取零件",
+    }]
     for index in range(frames):
         rows.append({
             "frame_idx": index,
@@ -50,13 +57,32 @@ def make_episode(root: Path, relative: str = "289/2026-08-30/task/episode_000001
                 name: {"path": value, "frame_id": index, "is_repeat": False, "frames_dropped": 0}
                 for name, value in streams.items()
             },
+            "task": {"task_title": task_title, "episode_id": episode_id},
+            "joints": {
+                "position": [float(index)] * 23,
+                "velocity": [0.0] * 23,
+                "torque": [0.0] * 23,
+            },
+            "current_eef_pose": {
+                name: dict(pose) for name in ("left_eef_pose", "right_eef_pose", "head_pose")
+            },
+            "target_eef_pose": {
+                name: dict(pose) for name in ("left_eef_pose", "right_eef_pose", "head_pose")
+            },
+            "current_height_z": {"height_z": 0.0},
+            "target_height_z": {"height_z": 0.0},
+            "robot_state": {"state": 2},
+            "control": {},
             "action": [float(index)],
         })
     rows.append({"_type": "session_footer", "aborted": False})
     (episode / "manifest.jsonl").write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8"
     )
-    (episode / "task_meta.json").write_text('{"description":"抓取零件"}\n', encoding="utf-8")
+    (episode / "task_meta.json").write_text(
+        json.dumps({"task_title": task_title, "description": "抓取零件"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
     return episode, streams
 
 
@@ -179,6 +205,87 @@ def test_ranges_trim_copy_overwrite_and_csv(tmp_path: Path) -> None:
         rows = list(csv.DictReader(handle))
     assert [row["operation_id"] for row in rows] == [first_id, second_id]
     assert not (output / ".lightworkbench-backups" / second_id).exists()
+
+
+def test_no_trim_normalizes_only_manifest_frame_indices_and_passes_preflight(tmp_path: Path) -> None:
+    root = tmp_path / "raw"
+    output = tmp_path / "cleaned"
+    relative = "289/2026-08-30/task/episode_000001"
+    episode, streams = make_episode(root, relative)
+    manifest = episode / "manifest.jsonl"
+    source_rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    source_frames = [row for row in source_rows if not isinstance(row.get("_type"), str)]
+    for index, row in enumerate(source_frames):
+        row["frame_idx"] = 500 + index
+        for entry in row["videos"].values():
+            entry["frame_id"] = 1000 + index
+        row["videos"]["hand_right"]["is_repeat"] = index == 2
+        row["videos"]["hand_right"]["frames_dropped"] = 7 if index == 2 else 0
+    manifest.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in source_rows), encoding="utf-8"
+    )
+    source_video_bytes = {
+        name: (episode / relative_path).read_bytes() for name, relative_path in streams.items()
+    }
+
+    created = submit(root, output, relative, "no_trim")
+    assert created.status_code == 202, created.text
+    finished = wait_operation(created.json()["operationId"])
+    assert finished["status"] == "completed", finished
+
+    destination = output / relative
+    output_rows = [
+        json.loads(line) for line in (destination / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    output_frames = [row for row in output_rows if not isinstance(row.get("_type"), str)]
+    assert [row["frame_idx"] for row in output_frames] == list(range(8))
+    assert all(
+        entry["frame_id"] == index
+        for index, row in enumerate(output_frames)
+        for entry in row["videos"].values()
+    )
+    expected_frames = json.loads(json.dumps(source_frames))
+    for index, row in enumerate(expected_frames):
+        row["frame_idx"] = index
+        for entry in row["videos"].values():
+            entry["frame_id"] = index
+    assert output_frames == expected_frames
+    assert output_frames[2]["videos"]["hand_right"]["is_repeat"] is True
+    assert output_frames[2]["videos"]["hand_right"]["frames_dropped"] == 7
+    assert {
+        name: (destination / relative_path).read_bytes() for name, relative_path in streams.items()
+    } == source_video_bytes
+    info = json.loads((destination / "CUT_INFO.json").read_text(encoding="utf-8"))
+    assert info["manifestNormalizationVersion"] == 1
+    assert info["normalizedFields"] == ["frame_idx", "videos.*.frame_id"]
+    assert validate_episode(output, destination).valid
+
+
+def test_converter_preflight_failure_never_publishes_to_cleaned(tmp_path: Path) -> None:
+    root = tmp_path / "raw"
+    output = tmp_path / "cleaned"
+    relative = "289/2026-08-30/task/episode_000001"
+    episode, streams = make_episode(root, relative)
+    manifest = episode / "manifest.jsonl"
+    rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        videos = row.get("videos")
+        if isinstance(videos, dict):
+            videos.pop("hand_left", None)
+    manifest.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8"
+    )
+    (episode / streams["hand_left"]).unlink()
+
+    created = submit(root, output, relative, "no_trim")
+    assert created.status_code == 202, created.text
+    finished = wait_operation(created.json()["operationId"])
+
+    assert finished["status"] == "failed"
+    assert "转换预检未通过" in finished["error"]
+    assert "required_video_missing:hand_left" in finished["error"]
+    assert not (output / relative).exists()
+    assert not list(tmp_path.glob(".cleaned.lightworkbench-staging-*"))
 
 
 def test_reject_too_short_stale_source_and_overlapping_output(tmp_path: Path) -> None:
