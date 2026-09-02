@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import math
 import os
 import shutil
 import subprocess
@@ -13,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from lightworkbench.app import app, browse_service
+from lightworkbench import config
 from lightworkbench.config import RESOURCES
 from lightworkbench.core import BrowseService, WorkbenchError, probe_video
 from lightworkbench.operations import normalize_ranges
@@ -315,8 +315,42 @@ def test_reject_too_short_stale_source_and_overlapping_output(tmp_path: Path) ->
     assert overlap.status_code == 400
 
 
-def test_cpu_budget_and_static_no_polling() -> None:
-    assert RESOURCES["budget"] == max(1, math.floor(float(RESOURCES["available"]) * 0.70))
+def test_cpu_budget_uses_all_available_cpus_without_affinity_mutation(monkeypatch: pytest.MonkeyPatch) -> None:
+    affinity_changes = []
+    monkeypatch.setattr(config.os, "sched_getaffinity", lambda _pid: {8, 2, 5, 3})
+    monkeypatch.setattr(config.os, "sched_setaffinity", lambda pid, cpus: affinity_changes.append((pid, cpus)))
+    monkeypatch.setattr(config, "_quota_cpu_count", lambda: None)
+
+    resources = config.resource_budget()
+
+    assert resources["available"] == 4
+    assert resources["budget"] == 4
+    assert resources["cpus"] == [2, 3, 5, 8]
+    assert affinity_changes == []
+
+
+@pytest.mark.parametrize(
+    ("quota", "expected_budget"),
+    [(3.75, 3), (0.25, 1), (20.0, 8)],
+)
+def test_cpu_budget_respects_cgroup_quota(
+    monkeypatch: pytest.MonkeyPatch, quota: float, expected_budget: int,
+) -> None:
+    quota_reads = []
+    monkeypatch.setattr(config.os, "sched_getaffinity", lambda _pid: set(range(8)))
+    monkeypatch.setattr(config, "_quota_cpu_count", lambda: quota_reads.append(quota) or quota)
+
+    resources = config.resource_budget(apply=False)
+
+    assert resources["quotaAvailable"] == quota
+    assert resources["available"] == min(8, quota)
+    assert resources["budget"] == expected_budget
+    assert len(resources["cpus"]) == expected_budget
+    assert quota_reads == [quota]
+
+
+def test_static_no_polling() -> None:
+    assert RESOURCES["budget"] == max(1, int(float(RESOURCES["available"])))
     assert len(RESOURCES["cpus"]) == RESOURCES["budget"]
     assert int(RESOURCES["webSlots"]) <= 2
     script = Path(__file__).parents[1] / "lightworkbench/static/app.js"

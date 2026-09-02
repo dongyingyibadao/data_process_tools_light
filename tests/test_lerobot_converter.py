@@ -5,6 +5,7 @@ import math
 import os
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -277,6 +278,206 @@ def test_video_encoding_mode_accepts_parallel_without_changing_default() -> None
         converter.ConverterConfig(video_encoding_mode="invalid")
 
 
+def test_video_workers_are_operational_and_do_not_change_incremental_state() -> None:
+    config = converter.ConverterConfig(video_workers=5)
+    assert config.video_workers == 5
+    assert "video_workers" not in config.state_value()
+    with pytest.raises(ValueError, match="positive"):
+        converter.ConverterConfig(video_workers=0)
+
+
+def test_streaming_video_workers_above_three_run_training_and_auxiliary_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_source(
+        tmp_path,
+        extra_streams=("rgbd_head_depth", "head_left", "head_right"),
+    )
+    rendezvous = threading.Barrier(2)
+    worker_counts: dict[str, int] = {}
+    committed: list[list[dict]] = []
+
+    def append_one(
+        runtime, root, repo_id, episode, config, *, create, action_mode, dataset_opened,
+    ):
+        worker_counts["training"] = config.video_workers
+        dataset_opened()
+        rendezvous.wait(timeout=2)
+        return 0
+
+    def encode_auxiliary(runtime, root, index, episode, config):
+        worker_counts["auxiliary"] = config.video_workers
+        rendezvous.wait(timeout=2)
+        return [
+            {"episode_index": index, "stream": stream}
+            for stream in sorted(set(episode.videos) - set(converter.TRAINING_VIDEO_STREAMS))
+        ]
+
+    monkeypatch.setattr(converter, "_append_one", append_one)
+    monkeypatch.setattr(converter, "_encode_auxiliary_episode", encode_auxiliary)
+    monkeypatch.setattr(
+        converter, "_commit_auxiliary_rows",
+        lambda runtime, root, index, episode, rows: committed.append(list(rows)),
+    )
+    monkeypatch.setattr(
+        converter, "source_episode_signature", lambda episode: {"digest": "stable"},
+    )
+
+    index = converter._append_episode_outputs(
+        {}, tmp_path / "output", "local/test", source,
+        converter.ConverterConfig(video_encoding_mode="streaming", video_workers=5),
+        create=True, expected_index=0,
+    )
+
+    assert index == 0
+    assert worker_counts == {"training": 3, "auxiliary": 2}
+    assert len(committed) == 1
+    assert {row["stream"] for row in committed[0]} == {
+        "rgbd_head_depth", "head_left", "head_right",
+    }
+
+
+def test_three_video_workers_keep_training_and_auxiliary_groups_sequential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_source(tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        converter, "_append_one",
+        lambda *args, **kwargs: calls.append("training") or 0,
+    )
+    monkeypatch.setattr(
+        converter, "_ensure_auxiliary_episode",
+        lambda *args, **kwargs: calls.append("auxiliary"),
+    )
+    monkeypatch.setattr(
+        converter, "_encode_auxiliary_episode",
+        lambda *args, **kwargs: pytest.fail("sequential path encoded auxiliary directly"),
+    )
+
+    converter._append_episode_outputs(
+        {}, tmp_path / "output", "local/test", source,
+        converter.ConverterConfig(video_encoding_mode="streaming", video_workers=3),
+        create=True, expected_index=0,
+    )
+
+    assert calls == ["training", "auxiliary"]
+
+
+def test_parallel_auxiliary_does_not_start_when_training_dataset_open_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_source(
+        tmp_path,
+        extra_streams=("rgbd_head_depth", "head_left", "head_right"),
+    )
+    auxiliary_calls: list[bool] = []
+    monkeypatch.setattr(
+        converter, "_append_one",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("open failed")),
+    )
+    monkeypatch.setattr(
+        converter, "_encode_auxiliary_episode",
+        lambda *args, **kwargs: auxiliary_calls.append(True) or [],
+    )
+    monkeypatch.setattr(
+        converter, "source_episode_signature", lambda episode: {"digest": "stable"},
+    )
+
+    with pytest.raises(RuntimeError, match="open failed"):
+        converter._append_episode_outputs(
+            {}, tmp_path / "output", "local/test", source,
+            converter.ConverterConfig(video_encoding_mode="streaming", video_workers=6),
+            create=True, expected_index=0,
+        )
+
+    assert auxiliary_calls == []
+
+
+def test_open_dataset_enables_async_image_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_source(tmp_path)
+    calls: list[dict] = []
+
+    class Dataset:
+        @classmethod
+        def create(cls, **kwargs):
+            calls.append(kwargs)
+            return object()
+
+    monkeypatch.setattr(converter, "_encoders", lambda *args: (None, None))
+    converter._open_dataset(
+        {"LeRobotDataset": Dataset},
+        tmp_path / "output",
+        "local/test",
+        source,
+        converter.ConverterConfig(video_workers=3),
+        create=True,
+    )
+
+    assert calls[0]["image_writer_threads"] == 3
+
+
+def test_open_dataset_streaming_queue_holds_the_complete_episode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_source(tmp_path)
+    calls: list[dict] = []
+
+    class Dataset:
+        @classmethod
+        def create(cls, **kwargs):
+            calls.append(kwargs)
+            return object()
+
+    monkeypatch.setattr(converter, "_encoders", lambda *args: (None, None))
+    converter._open_dataset(
+        {"LeRobotDataset": Dataset},
+        tmp_path / "output",
+        "local/test",
+        source,
+        converter.ConverterConfig(
+            video_encoding_mode="streaming", encoder_queue_maxsize=1,
+        ),
+        create=True,
+    )
+
+    assert calls[0]["streaming_encoding"] is True
+    assert calls[0]["encoder_queue_maxsize"] == len(source.records) + 1
+    assert calls[0]["image_writer_threads"] == 0
+
+
+def test_auxiliary_runtime_threads_are_explicitly_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int]] = []
+    cv2 = type("CV2", (), {"setNumThreads": lambda _self, value: calls.append(("cv2", value))})()
+    pa = type(
+        "PyArrow",
+        (),
+        {
+            "set_cpu_count": lambda _self, value: calls.append(("pa_cpu", value)),
+            "set_io_thread_count": lambda _self, value: calls.append(("pa_io", value)),
+        },
+    )()
+    monkeypatch.setenv("DATA_AUTOPRO_AUX_THREADS", "2")
+    monkeypatch.delitem(converter.sys.modules, "torch", raising=False)
+
+    converter._configure_auxiliary_threads(cv2, pa)
+
+    assert calls == [("cv2", 2), ("pa_cpu", 2), ("pa_io", 2)]
+
+
+@pytest.mark.parametrize("value", ("0", "invalid"))
+def test_auxiliary_runtime_threads_reject_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, value: str,
+) -> None:
+    monkeypatch.setenv("DATA_AUTOPRO_AUX_THREADS", value)
+    with pytest.raises(ValueError, match="positive integer"):
+        converter._configure_auxiliary_threads(object(), object())
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_parallel"),
     (("sequential", False), ("parallel", True), ("streaming", False)),
@@ -516,7 +717,7 @@ def test_merged_recovery_uses_pending_relative_path_when_numeric_ids_collide(
     monkeypatch.setattr(converter, "_dataset_episode_count", lambda *args: 2)
     monkeypatch.setattr(
         converter, "_verify_episode",
-        lambda runtime, root, repo_id, index, episode, action_mode: verified.append(episode.path),
+        lambda runtime, root, repo_id, index, episode, action_mode, video_workers: verified.append(episode.path),
     )
     monkeypatch.setattr(converter, "_ensure_auxiliary_episode", lambda *args: None)
 

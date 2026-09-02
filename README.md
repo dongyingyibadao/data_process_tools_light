@@ -95,7 +95,7 @@ data-autopro-light convert \
 
 确认报告后去掉 `--preflight-only` 执行转换。默认 `--action-mode both` 从同一批 cleaned Episode 生成两套数据：
 
-`--include-episode <input-root-relative-path>` 可重复使用，只转换精确列出的 Episode；重复、越界或未发现的路径会在写数据前拒绝。预检查默认在 CPU 预算内按 Episode 并行，也可通过 `--preflight-workers` 调低并发。视频参数可通过 `--video-codec`、`--video-crf`、`--encoder-preset`、`--encoder-threads` 和 `--video-encoding-mode` 配置，并写入 summary 和 conversion state。并行 H.264 示例：
+`--include-episode <input-root-relative-path>` 可重复使用，只转换精确列出的 Episode；重复、越界或未发现的路径会在写数据前拒绝。指定路径时转换器直接解析这些 Episode，不再扫描输入根下的其他 Episode。预检查默认在 CPU 预算内按 Episode 并行，也可通过 `--preflight-workers` 调低并发。视频参数可通过 `--video-codec`、`--video-crf`、`--encoder-preset`、`--encoder-threads`、`--video-workers` 和 `--video-encoding-mode` 配置，并写入 summary；影响输出内容的参数也写入 conversion state。`--video-workers` 只控制调度，不改变输出，因此可在增量续跑时调整。值不超过 3 时控制每组三路视频的读取和校验；streaming 模式设为 4–6 时，训练视频和辅助视频两组会同时编码，并在两组完成后统一提交。并行 H.264 示例：
 
 ```bash
 data-autopro-light convert \
@@ -103,8 +103,10 @@ data-autopro-light convert \
   --output-root /path/to/lerobot \
   --include-episode date/site/task/episode_000001 \
   --video-codec h264 --video-crf 18 --encoder-preset fast \
-  --encoder-threads 6 --video-encoding-mode parallel
+  --encoder-threads 6 --video-workers 3 --video-encoding-mode parallel
 ```
+
+离线转换也可使用 `--video-encoding-mode streaming`，直接把解码帧送入每路视频编码器，省去 PNG/TIFF 中间文件。为避免 LeRobot 在编码队列满时静默丢帧，转换器会把每路队列扩展到能够容纳完整 Episode；因此该模式速度更高，但峰值内存随 Episode 帧数、分辨率和并行 Episode 数线性增长。超长 Episode 或内存受限机器应继续使用 `parallel`。
 
 ```text
 OUT/whole_body_joint/<relative-task>  # 三路训练视频的唯一 owner
@@ -120,8 +122,96 @@ OUT/.bundle/<relative-task>           # 每 Episode、每 mode 的提交 ledger
 data-autopro-light convert-merged \
   --input-root /inspire/qb-ilm/project/robot-decision/public/demo2/raw_08_29 \
   --video-codec h264 --video-crf 18 --encoder-preset fast \
-  --encoder-threads 6 --video-encoding-mode parallel
+  --encoder-threads 6 --video-workers 3 --video-encoding-mode parallel
 ```
+
+批量转换可先运行只读预检，再用 `scripts/run_merged_shards.py` 将连续 Episode 分片绑定到实际可用 CPU。脚本默认使用 `min(CPU affinity, cgroup quota)` 的完整预算，不再施加 70% 上限，并在 summary 中记录平均使用核心数和 quota 利用率。`--cpu-binding` 支持 `exclusive`、`numa-shared` 和 `global-shared`；独占绑定通常最稳定，共享模式适合存在明显长尾、需要进程动态借核的负载。当前 55 核环境的 1500 帧基准推荐：
+
+```bash
+python scripts/run_merged_shards.py \
+  --report /path/to/preflight/conversion_report.json \
+  --input-root /path/to/cleaned \
+  --work-root /path/to/sharded-output \
+  --shards 13 --cpu-binding exclusive \
+  --video-encoding-mode streaming \
+  --encoder-threads 2 --video-workers 4 --preflight-workers 1
+```
+
+### 并行全量转换与派生
+
+下面的完整流程先生成 `whole_body_joint` 分片，按 Episode 顺序合并 owner dataset，最后派生不重复编码视频的 `body_joint_eef` dataset。`RUN_ROOT` 必须是新的输出目录；需要续跑时保持路径、分片数和所有编码参数不变。
+
+```bash
+cd '/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/2026_cz/data_autopro_tools_light copy'
+
+export PYTHON='/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/miniconda3/envs/data_process/bin/python'
+export INPUT_ROOT='/inspire/qb-ilm/project/robot-decision/public/demo2/raw_08_29'
+export RUN_ROOT='/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/2026_cz/lerobot_data_08_29_optimized'
+export PREFLIGHT_ROOT="$RUN_ROOT/preflight"
+export SHARD_ROOT="$RUN_ROOT/shards"
+export FINAL_ROOT="$RUN_ROOT/final"
+export SHARD_COUNT=13
+
+mkdir -p "$RUN_ROOT"
+
+"$PYTHON" -m lightworkbench.cli convert-merged \
+  --input-root "$INPUT_ROOT" \
+  --output-root "$PREFLIGHT_ROOT" \
+  --preflight-only \
+  --action-mode whole_body_joint \
+  --video-codec h264 \
+  --video-crf 18 \
+  --encoder-preset fast \
+  --encoder-threads 2 \
+  --video-workers 4 \
+  --video-encoding-mode streaming \
+  --preflight-workers 13 \
+  2>&1 | tee "$RUN_ROOT/preflight.log"
+
+"$PYTHON" scripts/run_merged_shards.py \
+  --report "$PREFLIGHT_ROOT/conversion_report.json" \
+  --input-root "$INPUT_ROOT" \
+  --work-root "$SHARD_ROOT" \
+  --shards "$SHARD_COUNT" \
+  --cpu-binding exclusive \
+  --video-encoding-mode streaming \
+  --encoder-threads 2 \
+  --video-workers 4 \
+  --preflight-workers 1 \
+  --python "$PYTHON" \
+  2>&1 | tee "$RUN_ROOT/convert_shards.log"
+
+"$PYTHON" - <<'PY' 2>&1 | tee "$RUN_ROOT/merge.log"
+import os
+from pathlib import Path
+
+from lightworkbench.shard_merge import merge_whole_body_joint_shards
+
+shard_root = Path(os.environ["SHARD_ROOT"])
+final_root = Path(os.environ["FINAL_ROOT"])
+shard_count = int(os.environ["SHARD_COUNT"])
+result = merge_whole_body_joint_shards(
+    [shard_root / f"shard-{index:02d}" for index in range(shard_count)],
+    final_root / "whole_body_joint",
+)
+print(result)
+PY
+
+"$PYTHON" -m lightworkbench.cli convert-merged \
+  --input-root "$INPUT_ROOT" \
+  --output-root "$FINAL_ROOT" \
+  --action-mode body_joint_eef \
+  --video-codec h264 \
+  --video-crf 18 \
+  --encoder-preset fast \
+  --encoder-threads 2 \
+  --video-workers 4 \
+  --video-encoding-mode streaming \
+  --preflight-workers 13 \
+  2>&1 | tee "$RUN_ROOT/derive_body_joint_eef.log"
+```
+
+最终训练入口为 `$FINAL_ROOT/whole_body_joint` 和 `$FINAL_ROOT/body_joint_eef`。分片转换可原路径重跑并复用已完成 shard；merge 的目标目录必须不存在，避免覆盖已经发布的数据。
 
 省略 `--output-root` 时默认写入 `<input-root>/lerobot_data`：
 

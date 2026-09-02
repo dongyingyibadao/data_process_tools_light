@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import resource
 import shutil
 import subprocess
 import sys
@@ -21,40 +23,184 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 def _partition_contiguous(episodes: list[dict[str, Any]], count: int) -> list[list[dict[str, Any]]]:
     if count < 1 or count > len(episodes):
         raise ValueError("shard count must be between 1 and the accepted episode count")
-    total_frames = sum(int(item["frames"]) for item in episodes)
-    shards: list[list[dict[str, Any]]] = []
-    start = 0
-    consumed = 0
-    for shard_index in range(count - 1):
-        remaining_shards = count - shard_index
-        target = (total_frames - consumed) / remaining_shards
-        frames = 0
-        end = start
-        maximum_end = len(episodes) - (remaining_shards - 1)
-        while end < maximum_end:
-            candidate = int(episodes[end]["frames"])
-            if end > start and abs(frames - target) <= abs(frames + candidate - target):
-                break
-            frames += candidate
-            end += 1
-        shards.append(episodes[start:end])
+    frames = [int(item["frames"]) for item in episodes]
+    if any(value <= 0 for value in frames):
+        raise ValueError("accepted episode frame counts must be positive")
+
+    def groups_needed(limit: int) -> int:
+        groups = 1
+        current = 0
+        for value in frames:
+            if current and current + value > limit:
+                groups += 1
+                current = 0
+            current += value
+        return groups
+
+    lower, upper = max(frames), sum(frames)
+    while lower < upper:
+        middle = (lower + upper) // 2
+        if groups_needed(middle) <= count:
+            upper = middle
+        else:
+            lower = middle + 1
+    limit = lower
+
+    shards: list[list[dict[str, Any]]] = [[] for _ in range(count)]
+    end = len(episodes)
+    for shard_index in range(count - 1, 0, -1):
         start = end
-        consumed += frames
-    shards.append(episodes[start:])
+        total = 0
+        while start > shard_index and total + frames[start - 1] <= limit:
+            start -= 1
+            total += frames[start]
+        shards[shard_index] = episodes[start:end]
+        end = start
+    shards[0] = episodes[:end]
     return shards
 
 
-def _cpu_groups(cpu_count: int, shard_count: int) -> list[list[int]]:
-    if cpu_count < shard_count:
-        raise ValueError("cpu count must be at least the shard count")
-    base, remainder = divmod(cpu_count, shard_count)
+def _quota_cpu_count() -> float | None:
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()[:2]
+        if quota != "max":
+            return max(0.01, int(quota) / int(period))
+    except (OSError, ValueError, ZeroDivisionError):
+        pass
+    try:
+        quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+        period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+        if quota > 0:
+            return max(0.01, quota / period)
+    except (OSError, ValueError, ZeroDivisionError):
+        pass
+    return None
+
+
+def _affinity_cpu_ids() -> list[int]:
+    if hasattr(os, "sched_getaffinity"):
+        return sorted(os.sched_getaffinity(0))
+    return list(range(os.cpu_count() or 1))
+
+
+def _spread_cpu_ids(cpu_ids: Sequence[int], count: int) -> list[int]:
+    """Select CPUs across the full affinity range instead of one NUMA prefix."""
+
+    if count < 1 or count > len(cpu_ids):
+        raise ValueError("CPU count must be between 1 and the affinity CPU count")
+    if count == len(cpu_ids):
+        return list(cpu_ids)
+    if count == 1:
+        return [cpu_ids[0]]
+    return [cpu_ids[index * (len(cpu_ids) - 1) // (count - 1)] for index in range(count)]
+
+
+def _effective_cpu_ids(requested: int | None = None) -> tuple[list[int], dict[str, Any]]:
+    affinity = _affinity_cpu_ids()
+    quota = _quota_cpu_count()
+    available = min(len(affinity), math.floor(quota) if quota is not None else len(affinity))
+    available = max(1, available)
+    count = available if requested is None else requested
+    if count < 1 or count > available:
+        raise ValueError(f"--cpus must be between 1 and the effective CPU budget ({available})")
+    selected = _spread_cpu_ids(affinity, count)
+    return selected, {
+        "affinity_cpu_ids": affinity,
+        "affinity_count": len(affinity),
+        "quota_cpus": quota,
+        "effective_cpu_budget": available,
+        "selected_cpu_ids": selected,
+    }
+
+
+def _cpu_groups(cpu_ids: Sequence[int], shard_count: int) -> list[list[int]]:
+    if len(cpu_ids) < shard_count:
+        raise ValueError("CPU count must be at least the shard count")
+    base, remainder = divmod(len(cpu_ids), shard_count)
     groups: list[list[int]] = []
     start = 0
     for index in range(shard_count):
         size = base + (1 if index < remainder else 0)
-        groups.append(list(range(start, start + size)))
+        groups.append(list(cpu_ids[start:start + size]))
         start += size
     return groups
+
+
+def _parse_cpu_list(value: str) -> list[int]:
+    cpus: set[int] = set()
+    for raw_part in value.strip().split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            raw_start, raw_end = part.split("-", 1)
+            start, end = int(raw_start), int(raw_end)
+            if start < 0 or end < start:
+                raise ValueError(f"invalid CPU range: {part!r}")
+            cpus.update(range(start, end + 1))
+        else:
+            cpu = int(part)
+            if cpu < 0:
+                raise ValueError(f"invalid CPU id: {part!r}")
+            cpus.add(cpu)
+    return sorted(cpus)
+
+
+def _numa_cpu_groups(
+    cpu_ids: Sequence[int],
+    topology_root: Path = Path("/sys/devices/system/node"),
+) -> list[list[int]]:
+    selected = set(cpu_ids)
+    if not selected:
+        raise ValueError("at least one effective CPU is required")
+    node_paths = sorted(
+        (
+            path
+            for path in topology_root.glob("node[0-9]*")
+            if path.name.removeprefix("node").isdigit()
+        ),
+        key=lambda path: int(path.name.removeprefix("node")),
+    )
+    groups: list[list[int]] = []
+    covered: set[int] = set()
+    for node_path in node_paths:
+        cpulist_path = node_path / "cpulist"
+        if not cpulist_path.is_file():
+            continue
+        node_cpus = selected.intersection(_parse_cpu_list(cpulist_path.read_text(encoding="utf-8")))
+        if node_cpus:
+            groups.append(sorted(node_cpus))
+            covered.update(node_cpus)
+    if not groups:
+        raise RuntimeError(f"no NUMA CPU topology found below {topology_root}")
+    if covered != selected:
+        missing = sorted(selected - covered)
+        raise RuntimeError(f"effective CPUs are missing from NUMA topology: {missing}")
+    return groups
+
+
+def _cpu_assignments(
+    cpu_ids: Sequence[int],
+    shard_count: int,
+    binding: str,
+    *,
+    topology_root: Path = Path("/sys/devices/system/node"),
+) -> list[list[int]]:
+    if shard_count < 1:
+        raise ValueError("shard count must be at least 1")
+    if binding == "exclusive":
+        return _cpu_groups(cpu_ids, shard_count)
+    if binding == "global-shared":
+        if not cpu_ids:
+            raise ValueError("at least one effective CPU is required")
+        return [list(cpu_ids) for _ in range(shard_count)]
+    if binding == "numa-shared":
+        nodes = _numa_cpu_groups(cpu_ids, topology_root)
+        return [
+            list(nodes[min(index * len(nodes) // shard_count, len(nodes) - 1)])
+            for index in range(shard_count)
+        ]
+    raise ValueError(f"unsupported CPU binding mode: {binding}")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -64,7 +210,9 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _shard_status(root: Path, selected: Sequence[str]) -> tuple[bool, dict[str, Any]]:
+def _shard_status(
+    root: Path, selected: Sequence[str], expected_frames: int | None = None,
+) -> tuple[bool, dict[str, Any]]:
     report_path = root / "conversion_report.json"
     state_path = root / "whole_body_joint" / "conversion_state.json"
     if not report_path.is_file() or not state_path.is_file():
@@ -77,20 +225,24 @@ def _shard_status(root: Path, selected: Sequence[str]) -> tuple[bool, dict[str, 
     entries = state.get("episodes", [])
     state_paths = [str(item.get("source_relative_path")) for item in entries]
     indices = [item.get("lerobot_episode_index") for item in entries]
+    committed_frames = sum(int(item.get("output_frames") or 0) for item in entries)
     complete = (
         report.get("preflight_only") is False
         and report.get("action_mode") == "whole_body_joint"
         and not failed
-        and sorted(accepted + skipped) == sorted(selected)
+        and accepted == list(selected)
+        and not skipped
         and state.get("pending_episode") is None
         and state_paths == accepted
         and indices == list(range(len(entries)))
+        and (expected_frames is None or committed_frames == expected_frames)
     )
     return complete, {
         "accepted": len(accepted),
         "skipped": len(skipped),
         "failed": len(failed),
         "committed": len(entries),
+        "committed_frames": committed_frames,
         "reason": None if complete else "terminal_state_validation_failed",
     }
 
@@ -101,9 +253,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-root", type=Path, required=True)
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--shards", type=int, default=6)
-    parser.add_argument("--cpus", type=int, default=54, help="CPU ids starting at zero to divide across shards")
+    parser.add_argument(
+        "--cpus", type=int, default=None,
+        help="effective CPUs to divide across shards (default: min(affinity, cgroup quota))",
+    )
+    parser.add_argument(
+        "--cpu-binding",
+        choices=("exclusive", "numa-shared", "global-shared"),
+        default="exclusive",
+        help="CPU affinity policy for shard processes (default: exclusive)",
+    )
     parser.add_argument("--encoder-threads", type=int, default=4)
+    parser.add_argument("--video-workers", type=int, default=3)
     parser.add_argument("--preflight-workers", type=int, default=6)
+    parser.add_argument(
+        "--video-encoding-mode", choices=("sequential", "parallel", "streaming"), default="parallel",
+    )
     parser.add_argument("--python", default=sys.executable)
     return parser
 
@@ -117,7 +282,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not episodes:
         raise ValueError("preflight report has no accepted episodes")
     shards = _partition_contiguous(episodes, args.shards)
-    cpu_groups = _cpu_groups(args.cpus, args.shards)
+    cpu_ids, cpu_resources = _effective_cpu_ids(args.cpus)
+    cpu_groups = _cpu_assignments(cpu_ids, args.shards, args.cpu_binding)
     taskset = shutil.which("taskset")
     if taskset is None:
         raise RuntimeError("taskset is required for bounded parallel shard conversion")
@@ -126,10 +292,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     work_root = args.work_root.resolve()
     work_root.mkdir(parents=True, exist_ok=True)
     plan = {
-        "version": 1,
+        "version": 2,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "input_root": str(input_root),
         "preflight_report": str(args.report.resolve()),
+        "cpu_resources": cpu_resources,
+        "cpu_binding": args.cpu_binding,
+        "encoder_threads": args.encoder_threads,
+        "video_workers": args.video_workers,
+        "video_encoding_mode": args.video_encoding_mode,
         "shards": [
             {
                 "index": index,
@@ -143,22 +314,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     _atomic_json(work_root / "shard_plan.json", plan)
 
-    running: list[tuple[int, subprocess.Popen[bytes], Any, Path, list[str]]] = []
+    running: dict[int, dict[str, Any]] = {}
     results: list[dict[str, Any]] = []
     env = os.environ.copy()
     env.update({
         "PYTHONUNBUFFERED": "1",
         "OMP_NUM_THREADS": "1",
+        "OMP_THREAD_LIMIT": "1",
+        "OMP_DYNAMIC": "FALSE",
         "MKL_NUM_THREADS": "1",
+        "MKL_DYNAMIC": "FALSE",
         "OPENBLAS_NUM_THREADS": "1",
+        "BLIS_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "VECLIB_MAXIMUM_THREADS": "1",
+        "OPENCV_FOR_THREADS_NUM": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "DATA_AUTOPRO_AUX_THREADS": "1",
     })
+    child_usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    launcher_started_at = time.time()
+    launcher_started_monotonic = time.monotonic()
     for item in plan["shards"]:
         index = int(item["index"])
         output_root = Path(str(item["output_root"]))
         selected = list(item["episodes"])
-        complete, status = _shard_status(output_root, selected)
+        complete, status = _shard_status(output_root, selected, int(item["frames"]))
         if complete:
-            results.append({"index": index, "returncode": 0, "reused": True, **status})
+            results.append({
+                "index": index, "returncode": 0, "reused": True,
+                "episodes": len(selected), "frames": int(item["frames"]),
+                "cpus": list(item["cpus"]), "wall_seconds": 0.0, **status,
+            })
             continue
         command = [
             taskset,
@@ -183,7 +370,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--encoder-threads",
             str(args.encoder_threads),
             "--video-encoding-mode",
-            "parallel",
+            args.video_encoding_mode,
+            "--video-workers",
+            str(args.video_workers),
             "--preflight-workers",
             str(args.preflight_workers),
         ]
@@ -191,6 +380,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             command.extend(("--include-episode", relative))
         log_path = work_root / f"shard-{index:02d}.log"
         log_handle = log_path.open("ab", buffering=0)
+        started_monotonic = time.monotonic()
         process = subprocess.Popen(
             command,
             cwd=Path(__file__).resolve().parents[1],
@@ -198,23 +388,87 @@ def main(argv: Sequence[str] | None = None) -> int:
             stdout=log_handle,
             stderr=subprocess.STDOUT,
         )
-        running.append((index, process, log_handle, output_root, selected))
+        started_at = time.time()
+        running[index] = {
+            "process": process,
+            "log_handle": log_handle,
+            "output_root": output_root,
+            "selected": selected,
+            "frames": int(item["frames"]),
+            "cpus": list(item["cpus"]),
+            "started_monotonic": started_monotonic,
+            "started_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at)),
+        }
         print(f"started shard {index:02d}: pid={process.pid} episodes={len(selected)} frames={item['frames']}", flush=True)
 
     failed = False
-    for index, process, log_handle, output_root, selected in running:
-        returncode = process.wait()
-        log_handle.close()
-        complete, status = _shard_status(output_root, selected)
-        results.append({"index": index, "returncode": returncode, "reused": False, **status})
-        failed = failed or not complete
-        print(
-            f"finished shard {index:02d}: rc={returncode} complete={complete} "
-            f"committed={status.get('committed', 0)} skipped={status.get('skipped', 0)}",
-            flush=True,
-        )
+    while running:
+        for index, item in list(running.items()):
+            process = item["process"]
+            returncode = process.poll()
+            if returncode is None:
+                continue
+            finished_at = time.time()
+            finished_monotonic = time.monotonic()
+            item["log_handle"].close()
+            complete, status = _shard_status(
+                item["output_root"], item["selected"], item["frames"],
+            )
+            results.append({
+                "index": index,
+                "returncode": returncode,
+                "reused": False,
+                "pid": process.pid,
+                "episodes": len(item["selected"]),
+                "frames": item["frames"],
+                "cpus": item["cpus"],
+                "started_at_utc": item["started_at_utc"],
+                "finished_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(finished_at)),
+                "wall_seconds": round(finished_monotonic - item["started_monotonic"], 6),
+                **status,
+            })
+            failed = failed or returncode != 0 or not complete
+            print(
+                f"finished shard {index:02d}: rc={returncode} complete={complete} "
+                f"committed={status.get('committed', 0)} skipped={status.get('skipped', 0)} "
+                f"wall={finished_monotonic - item['started_monotonic']:.2f}s",
+                flush=True,
+            )
+            del running[index]
+        if running:
+            time.sleep(0.1)
     results.sort(key=lambda item: int(item["index"]))
-    _atomic_json(work_root / "shard_run_summary.json", {"version": 1, "results": results})
+    launcher_finished_at = time.time()
+    launcher_finished_monotonic = time.monotonic()
+    child_usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    total_frames = sum(int(item["frames"]) for item in plan["shards"])
+    wall_seconds = launcher_finished_monotonic - launcher_started_monotonic
+    user_seconds = child_usage_after.ru_utime - child_usage_before.ru_utime
+    system_seconds = child_usage_after.ru_stime - child_usage_before.ru_stime
+    average_used_cores = (user_seconds + system_seconds) / wall_seconds if wall_seconds else 0.0
+    effective_budget = int(cpu_resources["effective_cpu_budget"])
+    _atomic_json(
+        work_root / "shard_run_summary.json",
+        {
+            "version": 2,
+            "started_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(launcher_started_at)),
+            "finished_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(launcher_finished_at)),
+            "wall_seconds": round(wall_seconds, 6),
+            "user_seconds": round(user_seconds, 6),
+            "system_seconds": round(system_seconds, 6),
+            "average_used_cores": round(average_used_cores, 6),
+            "cpu_budget_utilization_pct": round(average_used_cores / effective_budget * 100, 6),
+            "max_rss_kib": child_usage_after.ru_maxrss,
+            "frames": total_frames,
+            "frames_per_second": round(total_frames / wall_seconds, 6) if wall_seconds else None,
+            "cpu_resources": cpu_resources,
+            "cpu_binding": args.cpu_binding,
+            "encoder_threads": args.encoder_threads,
+            "video_workers": args.video_workers,
+            "video_encoding_mode": args.video_encoding_mode,
+            "results": results,
+        },
+    )
     return 1 if failed else 0
 
 

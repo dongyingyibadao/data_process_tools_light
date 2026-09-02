@@ -15,6 +15,7 @@ from typing import Any, Sequence
 
 from .config import RESOURCES
 from .validation import (
+    EPISODE_RE,
     REQUIRED_COLOR_STREAMS,
     EpisodeValidation,
     discover_episodes,
@@ -157,6 +158,15 @@ def _select_episodes(
 ) -> tuple[list[Path], list[str]]:
     if not selectors:
         return discovered, []
+    normalized = _normalize_episode_selectors(selectors)
+    by_relative = {path.relative_to(input_root).as_posix(): path for path in discovered}
+    missing = [value for value in normalized if value not in by_relative]
+    if missing:
+        raise ValueError(f"included Episode path was not discovered: {missing[0]}")
+    return [by_relative[value] for value in normalized], normalized
+
+
+def _normalize_episode_selectors(selectors: Sequence[str]) -> list[str]:
     normalized: list[str] = []
     for raw in selectors:
         selector = Path(raw.strip())
@@ -166,11 +176,57 @@ def _select_episodes(
         if value in normalized:
             raise ValueError(f"duplicate included Episode path: {value}")
         normalized.append(value)
-    by_relative = {path.relative_to(input_root).as_posix(): path for path in discovered}
-    missing = [value for value in normalized if value not in by_relative]
+    return normalized
+
+
+def _resolve_included_episodes(
+    input_root: Path,
+    selectors: Sequence[str],
+    *,
+    excluded_root: Path | None = None,
+) -> tuple[list[Path], list[str]]:
+    normalized = _normalize_episode_selectors(selectors)
+    selected: list[Path] = []
+    missing: list[str] = []
+    for value in normalized:
+        candidate = input_root / value
+        current = input_root
+        has_symlink = False
+        for part in Path(value).parts:
+            current /= part
+            if current.is_symlink():
+                has_symlink = True
+                break
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(input_root)
+        except (OSError, RuntimeError, ValueError):
+            missing.append(value)
+            continue
+        excluded = excluded_root is not None and excluded_root in (resolved, *resolved.parents)
+        if (
+            has_symlink
+            or excluded
+            or not resolved.is_dir()
+            or not EPISODE_RE.fullmatch(resolved.name)
+        ):
+            missing.append(value)
+            continue
+        selected.append(resolved)
     if missing:
         raise ValueError(f"included Episode path was not discovered: {missing[0]}")
-    return [by_relative[value] for value in normalized], normalized
+    return selected, normalized
+
+
+def _output_inside_episode(input_root: Path, output_root: Path) -> bool:
+    if input_root not in output_root.parents:
+        return False
+    for parent in output_root.parents:
+        if parent == input_root:
+            break
+        if parent.is_dir() and not parent.is_symlink() and EPISODE_RE.fullmatch(parent.name):
+            return True
+    return False
 
 
 def _validate_episodes(
@@ -526,11 +582,16 @@ def convert(args: argparse.Namespace) -> int:
         "encoder_preset": args.encoder_preset,
         "encoder_threads": args.encoder_threads,
         "video_encoding_mode": args.video_encoding_mode,
+        "video_workers": args.video_workers,
     }
 
-    discovered_all = discover_episodes(input_root)
     try:
-        discovered, included = _select_episodes(input_root, discovered_all, args.include_episode)
+        if args.include_episode:
+            discovered_all, included = _resolve_included_episodes(input_root, args.include_episode)
+            discovered = list(discovered_all)
+        else:
+            discovered_all = discover_episodes(input_root)
+            discovered, included = _select_episodes(input_root, discovered_all, ())
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -709,16 +770,23 @@ def convert_merged(args: argparse.Namespace) -> int:
         "encoder_preset": args.encoder_preset,
         "encoder_threads": args.encoder_threads,
         "video_encoding_mode": args.video_encoding_mode,
+        "video_workers": args.video_workers,
     }
-    discovered_all = [
-        path for path in discover_episodes(input_root)
-        if output_root not in (path, *path.parents)
-    ]
-    if any(episode in output_root.parents for episode in discovered_all):
+    if _output_inside_episode(input_root, output_root):
         print("output root must not be inside a cleaned Episode", file=sys.stderr)
         return 2
     try:
-        discovered, included = _select_episodes(input_root, discovered_all, args.include_episode)
+        if args.include_episode:
+            discovered_all, included = _resolve_included_episodes(
+                input_root, args.include_episode, excluded_root=output_root,
+            )
+            discovered = list(discovered_all)
+        else:
+            discovered_all = [
+                path for path in discover_episodes(input_root)
+                if output_root not in (path, *path.parents)
+            ]
+            discovered, included = _select_episodes(input_root, discovered_all, ())
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -906,7 +974,11 @@ def _add_conversion_arguments(command: argparse.ArgumentParser, *, output_requir
     command.add_argument("--video-codec", choices=("h264", "libsvtav1"), default="libsvtav1")
     command.add_argument("--video-crf", type=int, default=23)
     command.add_argument("--encoder-preset", type=_encoder_preset, default=8)
-    command.add_argument("--encoder-threads", type=int, default=1)
+    command.add_argument("--encoder-threads", type=_positive_int, default=1)
+    command.add_argument(
+        "--video-workers", type=_positive_int, default=3,
+        help="parallel source decode, image staging, and verification workers per Episode",
+    )
     command.add_argument(
         "--video-encoding-mode", choices=("sequential", "parallel", "streaming"),
         default="sequential",

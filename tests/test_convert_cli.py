@@ -312,12 +312,12 @@ def test_include_episode_selects_exact_paths_and_reports_discovery_counts(
 
     assert code == 0
     summary = json.loads((output / "conversion_summary.json").read_text(encoding="utf-8"))
-    assert summary["discovered_episodes"] == 2
+    assert summary["discovered_episodes"] == 1
     assert summary["selected_episodes"] == 1
     assert summary["included_episodes"] == ["date/task/episode_000002"]
     assert summary["encoder_config"] == {
         "video_codec": "h264", "video_crf": 18, "encoder_preset": "fast",
-        "encoder_threads": 6, "video_encoding_mode": "parallel",
+        "encoder_threads": 6, "video_encoding_mode": "parallel", "video_workers": 3,
     }
     report = json.loads((output / "date/task/conversion_report.json").read_text(encoding="utf-8"))
     assert [item["episode_id"] for item in report["accepted"]] == [2]
@@ -332,10 +332,13 @@ def test_include_episode_selects_exact_paths_and_reports_discovery_counts(
     ],
 )
 def test_include_episode_rejects_duplicate_unsafe_and_missing_paths(
-    tmp_path: Path, selectors: list[str],
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selectors: list[str],
 ) -> None:
     root = tmp_path / "cleaned"
     make_cleaned_episode(root, "date/task/episode_000001")
+    monkeypatch.setattr(
+        cli, "discover_episodes", lambda _root: pytest.fail("include path performed full discovery"),
+    )
 
     code = cli.main([
         "convert", "--input-root", str(root), "--output-root", str(tmp_path / "output"),
@@ -537,6 +540,7 @@ def test_merged_conversion_calls_engine_with_per_episode_tasks_and_reports_path_
     assert conversion["config"]["video_codec"] == "h264"
     assert conversion["config"]["encoder_threads"] == 4
     assert conversion["config"]["video_encoding_mode"] == "parallel"
+    assert conversion["config"]["video_workers"] == 3
 
     report = json.loads((output / "conversion_report.json").read_text(encoding="utf-8"))
     by_path = {item["episode"]: item for item in report["accepted"]}
@@ -636,10 +640,66 @@ def test_merged_include_episode_uses_the_shared_exact_filter(
     assert code == 0
     summary = json.loads((output / "conversion_summary.json").read_text(encoding="utf-8"))
     report = json.loads((output / "conversion_report.json").read_text(encoding="utf-8"))
-    assert summary["discovered_episodes"] == 2
+    assert summary["discovered_episodes"] == 1
     assert summary["selected_episodes"] == 1
     assert summary["included_episodes"] == ["date/task_b/episode_000002"]
     assert [item["episode"] for item in report["accepted"]] == ["date/task_b/episode_000002"]
+
+
+def test_merged_include_resolves_exact_path_without_scanning_unrelated_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    make_cleaned_episode(root, "selected/task/episode_000001", task_title="selected")
+    make_cleaned_episode(root, "unrelated/task/episode_000002", task_title="unrelated")
+    output = tmp_path / "merged"
+    original_rglob = Path.rglob
+
+    def guarded_rglob(path: Path, pattern: str):
+        if path == root:
+            pytest.fail("include path scanned the input root")
+        return original_rglob(path, pattern)
+
+    monkeypatch.setattr(Path, "rglob", guarded_rglob)
+    monkeypatch.setattr(
+        cli, "discover_episodes", lambda _root: pytest.fail("include path performed full discovery"),
+    )
+    monkeypatch.setattr("lightworkbench.validation.probe_video", lambda path, decoded=True: fake_probe(path))
+
+    code = cli.main([
+        "convert-merged", "--input-root", str(root), "--output-root", str(output),
+        "--preflight-only", "--include-episode", "selected/task/episode_000001",
+    ])
+
+    assert code == 0
+    summary = json.loads((output / "conversion_summary.json").read_text(encoding="utf-8"))
+    report = json.loads((output / "conversion_report.json").read_text(encoding="utf-8"))
+    assert summary["discovered_episodes"] == summary["selected_episodes"] == 1
+    assert [item["episode"] for item in report["accepted"]] == ["selected/task/episode_000001"]
+
+
+def test_merged_include_preserves_output_directory_exclusions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "cleaned"
+    output = root / "lerobot_data"
+    make_cleaned_episode(output, "task/episode_000001")
+    monkeypatch.setattr(
+        cli, "discover_episodes", lambda _root: pytest.fail("include path performed full discovery"),
+    )
+
+    excluded = cli.main([
+        "convert-merged", "--input-root", str(root), "--output-root", str(output),
+        "--preflight-only", "--include-episode", "lerobot_data/task/episode_000001",
+    ])
+    nested = cli.main([
+        "convert-merged", "--input-root", str(root),
+        "--output-root", str(output / "task/episode_000001/result"),
+        "--preflight-only", "--include-episode", "lerobot_data/task/episode_000001",
+    ])
+
+    assert excluded == 2
+    assert nested == 2
 
 
 def test_preflight_rejects_duplicate_episode_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

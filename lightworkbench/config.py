@@ -35,16 +35,19 @@ def _quota_cpu_count() -> float | None:
 
 
 def resource_budget(apply: bool = True) -> dict[str, object]:
+    """Report the usable CPU budget without changing process affinity.
+
+    ``apply`` remains accepted for compatibility with existing callers.
+    """
     affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(os.cpu_count() or 1))
-    available = min(len(affinity), _quota_cpu_count() or len(affinity))
-    budget = max(1, math.floor(available * 0.70))
+    quota_available = _quota_cpu_count()
+    available = min(len(affinity), quota_available if quota_available is not None else len(affinity))
+    budget = max(1, math.floor(available))
     allowed = affinity[:budget]
-    if apply and hasattr(os, "sched_setaffinity"):
-        os.sched_setaffinity(0, allowed)
     web_slots = min(2, budget)
     return {
         "affinityAvailable": len(affinity),
-        "quotaAvailable": _quota_cpu_count(),
+        "quotaAvailable": quota_available,
         "available": available,
         "budget": budget,
         "cpus": allowed,

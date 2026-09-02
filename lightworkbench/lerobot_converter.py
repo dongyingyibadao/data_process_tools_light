@@ -14,10 +14,13 @@ import math
 import os
 import re
 import shutil
+import sys
+import threading
 import time
 import uuid
 from collections import Counter
-from dataclasses import asdict, dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -120,13 +123,14 @@ class ConverterConfig:
     encoder_threads: int = 1
     encoder_queue_maxsize: int = 30
     video_encoding_mode: str = "sequential"
+    video_workers: int = 3
 
     def __post_init__(self) -> None:
         if self.video_codec not in {"h264", "libsvtav1"}:
             raise ValueError(f"unsupported video codec: {self.video_codec}")
         if not 0 <= self.video_crf <= 63:
             raise ValueError("video_crf must be between 0 and 63")
-        if self.encoder_threads <= 0 or self.encoder_queue_maxsize <= 0:
+        if self.encoder_threads <= 0 or self.encoder_queue_maxsize <= 0 or self.video_workers <= 0:
             raise ValueError("encoder thread and queue settings must be positive")
         if self.video_encoding_mode not in {"sequential", "parallel", "streaming"}:
             raise ValueError("video_encoding_mode must be sequential, parallel, or streaming")
@@ -136,6 +140,8 @@ class ConverterConfig:
     ) -> dict[str, Any]:
         names = action_names(action_mode)
         value = asdict(self)
+        # Worker count changes scheduling only and remains compatible with existing datasets.
+        value.pop("video_workers")
         value.update(
             {
                 "schema_version": CONVERSION_SCHEMA_VERSION,
@@ -875,6 +881,29 @@ def build_features(
     return features
 
 
+def _configure_auxiliary_threads(cv2: Any, pa: Any) -> None:
+    raw = os.environ.get("DATA_AUTOPRO_AUX_THREADS")
+    if raw is None:
+        return
+    try:
+        threads = int(raw)
+    except ValueError as exc:
+        raise ValueError("DATA_AUTOPRO_AUX_THREADS must be a positive integer") from exc
+    if threads <= 0:
+        raise ValueError("DATA_AUTOPRO_AUX_THREADS must be a positive integer")
+    cv2.setNumThreads(threads)
+    pa.set_cpu_count(threads)
+    pa.set_io_thread_count(threads)
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        torch.set_num_threads(threads)
+        try:
+            torch.set_num_interop_threads(threads)
+        except RuntimeError:
+            # PyTorch only permits changing inter-op threads before parallel work starts.
+            pass
+
+
 def _heavy_runtime() -> dict[str, Any]:
     try:
         import av
@@ -891,6 +920,7 @@ def _heavy_runtime() -> dict[str, Any]:
         raise OptionalDependencyError(
             "LeRobot conversion dependencies are unavailable. Install the optional 'lerobot' dependency group."
         ) from exc
+    _configure_auxiliary_threads(cv2, pa)
     return {
         "av": av, "cv2": cv2, "np": np, "pa": pa, "pq": pq,
         "LeRobotDataset": LeRobotDataset,
@@ -980,14 +1010,25 @@ def _add_frames(
     episode: SourceEpisode,
     runtime: Mapping[str, Any],
     action_mode: str = WHOLE_BODY_JOINT,
+    video_workers: int = 1,
 ) -> None:
     readers: dict[str, _VideoReader] = {}
+    pool: ThreadPoolExecutor | None = None
     try:
         readers = {stream: _VideoReader(episode.videos[stream], runtime) for stream in TRAINING_VIDEO_STREAMS}
+        streams = ordered_video_streams(readers)
+        if video_workers > 1 and len(streams) > 1:
+            pool = ThreadPoolExecutor(
+                max_workers=min(video_workers, len(streams)), thread_name_prefix="source-video",
+            )
         for index in range(converted_episode_length(episode)):
             images: dict[str, Any] = {}
-            for stream in ordered_video_streams(readers):
-                image = readers[stream].read()
+            futures = (
+                {stream: pool.submit(readers[stream].read) for stream in streams}
+                if pool is not None else None
+            )
+            for stream in streams:
+                image = futures[stream].result() if futures is not None else readers[stream].read()
                 if image is None:
                     raise RuntimeError(f"{episode.path}: {stream} ended before frame {index}")
                 video = episode.videos[stream]
@@ -997,10 +1038,17 @@ def _add_frames(
                 images[video_key(stream)] = image
             dataset.add_frame(_make_frame(episode, index, images, runtime["np"], action_mode))
         # All manifest frames were consumed; prove there are no extras.
+        futures = (
+            {stream: pool.submit(readers[stream].read) for stream in streams}
+            if pool is not None else None
+        )
         for stream, reader in readers.items():
-            if reader.read() is not None:
+            extra = futures[stream].result() if futures is not None else reader.read()
+            if extra is not None:
                 raise RuntimeError(f"{episode.path}: {stream} has frames beyond manifest")
     finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
         for reader in readers.values():
             reader.close()
 
@@ -1025,12 +1073,18 @@ def _open_dataset(
     config: ConverterConfig, *, create: bool, action_mode: str = WHOLE_BODY_JOINT,
 ) -> Any:
     rgb, depth = _encoders(runtime, config, episode.fps)
+    queue_maxsize = config.encoder_queue_maxsize
+    if config.video_encoding_mode == "streaming":
+        # Offline conversion must never inherit LeRobot's queue-full frame dropping.
+        queue_maxsize = max(queue_maxsize, converted_episode_length(episode) + 1)
     common = {
         "repo_id": repo_id, "root": root, "video_backend": "pyav",
         "rgb_encoder": rgb, "depth_encoder": depth,
         "streaming_encoding": config.video_encoding_mode == "streaming",
-        "encoder_queue_maxsize": config.encoder_queue_maxsize,
+        "encoder_queue_maxsize": queue_maxsize,
         "encoder_threads": config.encoder_threads,
+        # Streaming feeds encoder queues directly and never writes staging images.
+        "image_writer_threads": 0 if config.video_encoding_mode == "streaming" else config.video_workers,
     }
     if create:
         return runtime["LeRobotDataset"].create(
@@ -1055,6 +1109,7 @@ def _dataset_episode_count(runtime: Mapping[str, Any], root: Path, repo_id: str)
 def _verify_episode(
     runtime: Mapping[str, Any], root: Path, repo_id: str, index: int,
     episode: SourceEpisode, action_mode: str = WHOLE_BODY_JOINT,
+    video_workers: int = 1,
 ) -> None:
     np = runtime["np"]
     dataset = runtime["LeRobotDataset"](
@@ -1115,17 +1170,30 @@ def _verify_episode(
                     episode.videos[stream].width,
                 ):
                     raise RuntimeError(f"LeRobot episode {index} video {stream} readback failed")
-        for stream in TRAINING_VIDEO_STREAMS:
-            output_path = root / dataset.meta.get_video_file_path(index, video_key(stream))
-            container = runtime["av"].open(str(output_path))
+        output_paths = {
+            stream: root / dataset.meta.get_video_file_path(index, video_key(stream))
+            for stream in TRAINING_VIDEO_STREAMS
+        }
+
+        def decoded_frames(path: Path) -> int:
+            container = runtime["av"].open(str(path))
             try:
-                decoded_frames = sum(1 for _ in container.decode(video=0))
+                return sum(1 for _ in container.decode(video=0))
             finally:
                 container.close()
-            if decoded_frames != end - start:
-                raise RuntimeError(
-                    f"LeRobot episode {index} video {stream} has {decoded_frames} frames, expected {end - start}"
-                )
+
+        with ThreadPoolExecutor(
+            max_workers=min(video_workers, len(output_paths)), thread_name_prefix="verify-video",
+        ) as pool:
+            decoded_by_stream = {
+                stream: pool.submit(decoded_frames, path) for stream, path in output_paths.items()
+            }
+            for stream in TRAINING_VIDEO_STREAMS:
+                decoded_frames = decoded_by_stream[stream].result()
+                if decoded_frames != end - start:
+                    raise RuntimeError(
+                        f"LeRobot episode {index} video {stream} has {decoded_frames} frames, expected {end - start}"
+                    )
     finally:
         finalize = getattr(dataset, "finalize", None)
         if callable(finalize):
@@ -1135,15 +1203,18 @@ def _verify_episode(
 def _append_one(
     runtime: Mapping[str, Any], root: Path, repo_id: str, episode: SourceEpisode,
     config: ConverterConfig, *, create: bool, action_mode: str = WHOLE_BODY_JOINT,
+    dataset_opened: Callable[[], None] | None = None,
 ) -> int:
     dataset = _open_dataset(
         runtime, root, repo_id, episode, config, create=create, action_mode=action_mode,
     )
+    if dataset_opened is not None:
+        dataset_opened()
     index = int(dataset.meta.total_episodes)
     signature_before = source_episode_signature(episode)
     try:
         try:
-            _add_frames(dataset, episode, runtime, action_mode)
+            _add_frames(dataset, episode, runtime, action_mode, config.video_workers)
             if source_episode_signature(episode)["digest"] != signature_before["digest"]:
                 raise RuntimeError("source episode changed while conversion was running")
         except Exception:
@@ -1153,7 +1224,7 @@ def _append_one(
         dataset.save_episode(parallel_encoding=config.video_encoding_mode == "parallel")
     finally:
         dataset.finalize()
-    _verify_episode(runtime, root, repo_id, index, episode, action_mode)
+    _verify_episode(runtime, root, repo_id, index, episode, action_mode, config.video_workers)
     return index
 
 
@@ -1253,14 +1324,30 @@ def _encode_auxiliary_episode(
         rgb_encoder=rgb,
         depth_encoder=depth,
         encoder_threads=config.encoder_threads,
+        image_writer_threads=(0 if config.video_encoding_mode == "streaming" else config.video_workers),
+        streaming_encoding=config.video_encoding_mode == "streaming",
+        encoder_queue_maxsize=(
+            max(config.encoder_queue_maxsize, len(episode.records) + 1)
+            if config.video_encoding_mode == "streaming"
+            else config.encoder_queue_maxsize
+        ),
     )
     readers: dict[str, _VideoReader] = {}
+    pool: ThreadPoolExecutor | None = None
     try:
         readers = {stream: _VideoReader(episode.videos[stream], runtime) for stream in streams}
+        if config.video_workers > 1 and len(streams) > 1:
+            pool = ThreadPoolExecutor(
+                max_workers=min(config.video_workers, len(streams)), thread_name_prefix="aux-source-video",
+            )
         for frame_index in range(len(episode.records)):
             frame: dict[str, Any] = {"task": episode.task}
+            futures = (
+                {stream: pool.submit(readers[stream].read) for stream in streams}
+                if pool is not None else None
+            )
             for stream in streams:
-                image = readers[stream].read()
+                image = futures[stream].result() if futures is not None else readers[stream].read()
                 if image is None:
                     raise RuntimeError(f"{episode.path}: auxiliary {stream} ended before frame {frame_index}")
                 video = episode.videos[stream]
@@ -1271,11 +1358,18 @@ def _encode_auxiliary_episode(
                     )
                 frame[video_key(stream)] = image
             dataset.add_frame(frame)
+        futures = (
+            {stream: pool.submit(readers[stream].read) for stream in streams}
+            if pool is not None else None
+        )
         for stream, reader in readers.items():
-            if reader.read() is not None:
+            extra = futures[stream].result() if futures is not None else reader.read()
+            if extra is not None:
                 raise RuntimeError(f"{episode.path}: auxiliary {stream} has frames beyond manifest")
         dataset.save_episode(parallel_encoding=config.video_encoding_mode == "parallel")
     finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
         for reader in readers.values():
             reader.close()
         dataset.finalize()
@@ -1354,6 +1448,98 @@ def _ensure_auxiliary_episode(
     _write_auxiliary_rows(runtime, root, rows)
 
 
+def _commit_auxiliary_rows(
+    runtime: Mapping[str, Any], root: Path, index: int, episode: SourceEpisode,
+    encoded_rows: Sequence[Mapping[str, Any]],
+) -> None:
+    rows = _read_auxiliary_rows(runtime, root)
+    present = {
+        str(row["stream"])
+        for row in rows
+        if int(row["episode_index"]) == index
+    }
+    if present:
+        raise StateConflictError(f"auxiliary index already contains episode {index}")
+    expected_streams = set(episode.videos) - set(TRAINING_VIDEO_STREAMS)
+    encoded_streams = {
+        str(row["stream"])
+        for row in encoded_rows
+        if int(row["episode_index"]) == index
+    }
+    if encoded_streams != expected_streams or len(encoded_rows) != len(expected_streams):
+        raise RuntimeError(
+            f"auxiliary encoder returned streams {sorted(encoded_streams)}, "
+            f"expected {sorted(expected_streams)}"
+        )
+    rows.extend(dict(row) for row in encoded_rows)
+    _write_auxiliary_rows(runtime, root, rows)
+
+
+def _append_episode_outputs(
+    runtime: Mapping[str, Any], root: Path, repo_id: str, episode: SourceEpisode,
+    config: ConverterConfig, *, create: bool, expected_index: int,
+    action_mode: str = WHOLE_BODY_JOINT,
+) -> int:
+    auxiliary_streams = set(episode.videos) - set(TRAINING_VIDEO_STREAMS)
+    parallel_groups = (
+        config.video_encoding_mode == "streaming"
+        and config.video_workers > len(TRAINING_VIDEO_STREAMS)
+        and bool(auxiliary_streams)
+    )
+    if not parallel_groups:
+        index = _append_one(
+            runtime, root, repo_id, episode, config, create=create, action_mode=action_mode,
+        )
+        if index != expected_index:
+            raise StateConflictError("LeRobot assigned a non-contiguous episode index")
+        _ensure_auxiliary_episode(runtime, root, index, episode, config)
+        return index
+
+    auxiliary_workers = min(len(auxiliary_streams), config.video_workers // 2)
+    training_workers = min(
+        len(TRAINING_VIDEO_STREAMS), config.video_workers - auxiliary_workers,
+    )
+    training_config = replace(config, video_workers=training_workers)
+    auxiliary_config = replace(config, video_workers=auxiliary_workers)
+    signature_before = source_episode_signature(episode)["digest"]
+
+    dataset_ready = threading.Event()
+    cancel_auxiliary = threading.Event()
+
+    def encode_auxiliary_after_dataset_open() -> list[dict[str, Any]]:
+        dataset_ready.wait()
+        if cancel_auxiliary.is_set():
+            return []
+        return _encode_auxiliary_episode(
+            runtime, root, expected_index, episode, auxiliary_config,
+        )
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="auxiliary-group") as pool:
+        auxiliary = pool.submit(encode_auxiliary_after_dataset_open)
+        try:
+            index = _append_one(
+                runtime, root, repo_id, episode, training_config,
+                create=create, action_mode=action_mode,
+                dataset_opened=dataset_ready.set,
+            )
+        except BaseException:
+            cancel_auxiliary.set()
+            dataset_ready.set()
+            try:
+                auxiliary.result()
+            except BaseException:
+                pass
+            raise
+        encoded_rows = auxiliary.result()
+
+    if index != expected_index:
+        raise StateConflictError("LeRobot assigned a non-contiguous episode index")
+    if source_episode_signature(episode)["digest"] != signature_before:
+        raise RuntimeError("source episode changed while conversion was running")
+    _commit_auxiliary_rows(runtime, root, index, episode, encoded_rows)
+    return index
+
+
 def _recover_uncommitted_state(
     runtime: Mapping[str, Any], root: Path, repo_id: str, state: dict[str, Any],
     episodes: Sequence[SourceEpisode], config: ConverterConfig,
@@ -1404,7 +1590,9 @@ def _recover_uncommitted_state(
         episode = by_id.get(source_id)
         if episode is None:
             raise StateConflictError(f"cannot recover saved episode for missing source id {source_id}")
-    _verify_episode(runtime, root, repo_id, known, episode, action_mode)
+    _verify_episode(
+        runtime, root, repo_id, known, episode, action_mode, config.video_workers,
+    )
     if action_mode == WHOLE_BODY_JOINT:
         _ensure_auxiliary_episode(runtime, root, known, episode, config)
     _append_state_episode(
@@ -1516,13 +1704,10 @@ def convert_task(
                     dataset_layout=dataset_layout,
                     source_root=source_task,
                 )
-                index = _append_one(
+                index = _append_episode_outputs(
                     runtime, output_root, repo_id, episode, config, create=False,
-                    action_mode=action_mode,
+                    expected_index=len(state["episodes"]), action_mode=action_mode,
                 )
-                if index != len(state["episodes"]):
-                    raise StateConflictError("LeRobot assigned a non-contiguous episode index")
-                _ensure_auxiliary_episode(runtime, output_root, index, episode, config)
                 _append_state_episode(
                     state,
                     episode,
@@ -1572,13 +1757,10 @@ def convert_task(
                         dataset_layout=dataset_layout,
                         source_root=source_task,
                     )
-                index = _append_one(
+                index = _append_episode_outputs(
                     runtime, staging, repo_id, episode, config, create=not appended,
-                    action_mode=action_mode,
+                    expected_index=len(state["episodes"]), action_mode=action_mode,
                 )
-                if index != len(state["episodes"]):
-                    raise StateConflictError("LeRobot assigned a non-contiguous episode index")
-                _ensure_auxiliary_episode(runtime, staging, index, episode, config)
                 _append_state_episode(
                     state,
                     episode,
