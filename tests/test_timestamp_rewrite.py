@@ -49,7 +49,7 @@ def _source_row(index: int) -> dict:
     }
 
 
-def _rewrite(tmp_path: Path, keep: set[int]) -> tuple[dict, list[dict], dict]:
+def _rewrite(tmp_path: Path, keep: set[int], *, virtual_video: bool = False) -> tuple[dict, list[dict], dict]:
     source = tmp_path / "source.jsonl"
     destination = tmp_path / "destination.jsonl"
     rows = [
@@ -64,7 +64,9 @@ def _rewrite(tmp_path: Path, keep: set[int]) -> tuple[dict, list[dict], dict]:
         "fingerprintExcludes": list(FINGERPRINT_EXCLUDES),
     }
 
-    assert rewrite_manifest(source, destination, keep, 10.0, audit) == len(keep)
+    assert rewrite_manifest(
+        source, destination, keep, 10.0, audit, virtual_video=virtual_video,
+    ) == len(keep)
     output = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
     return output[0], output[1:-1], output[-1]
 
@@ -131,6 +133,15 @@ def test_multiple_internal_removals_use_cumulative_segment_shifts(tmp_path: Path
     assert rows[4]["t_wall"] - rows[3]["t_wall"] == pytest.approx(WALL_TIMES[6] - WALL_TIMES[5])
     assert rows[3]["t_wall"] - rows[2]["t_wall"] == pytest.approx(WALL_TIMES[5] - WALL_TIMES[4])
     assert rows[5]["t_wall"] - rows[4]["t_wall"] == pytest.approx(WALL_TIMES[8] - WALL_TIMES[7])
+
+
+def test_virtual_manifest_records_physical_source_frames(tmp_path: Path) -> None:
+    kept_indices = [0, 1, 4, 5, 8]
+    _, rows, _ = _rewrite(tmp_path, set(kept_indices), virtual_video=True)
+
+    assert [row["frame_idx"] for row in rows] == list(range(len(kept_indices)))
+    assert [row["videos"]["head"]["frame_id"] for row in rows] == list(range(len(kept_indices)))
+    assert [row["videos"]["head"]["source_frame_id"] for row in rows] == kept_indices
 
 
 def test_fingerprint_excludes_only_root_cut_info(tmp_path: Path) -> None:

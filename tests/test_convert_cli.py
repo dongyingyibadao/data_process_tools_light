@@ -41,6 +41,7 @@ def make_cleaned_episode(
     ranges: list[list[int]] | None = None,
     source_frames: int = 3,
     rewrite_version: int | None = TIMESTAMP_REWRITE_VERSION,
+    virtual_video: bool = False,
 ) -> Path:
     episode = root / relative
     episode.mkdir(parents=True)
@@ -59,6 +60,11 @@ def make_cleaned_episode(
         "task_title": task_title,
         "task_description": description,
     }]
+    removed = ranges or []
+    kept_ids = [
+        index for index in range(source_frames)
+        if not any(start <= index < end for start, end in removed)
+    ]
     for index in range(3):
         control = {}
         if index == 0:
@@ -69,7 +75,12 @@ def make_cleaned_episode(
             "t_ns": 10_000_000_000 + index,
             "task": {"task_title": task_title, "episode_id": int(episode.name.split("_")[-1])},
             "videos": {
-                name: {"path": value, "frame_id": index, "is_repeat": False}
+                name: {
+                    "path": value,
+                    "frame_id": index,
+                    "is_repeat": False,
+                    **({"source_frame_id": kept_ids[index]} if virtual_video else {}),
+                }
                 for name, value in paths.items()
             },
             "joints": {
@@ -96,7 +107,6 @@ def make_cleaned_episode(
     (episode / "task_meta.json").write_text(json.dumps({
         "task_title": task_title, "task_description": description,
     }, ensure_ascii=False), encoding="utf-8")
-    removed = ranges or []
     output_frames = source_frames - sum(end - start for start, end in removed)
     audit = {
         "operationId": "operation",
@@ -114,6 +124,19 @@ def make_cleaned_episode(
     }
     if rewrite_version is not None:
         audit["timestampRewriteVersion"] = rewrite_version
+    if virtual_video:
+        spans = []
+        for source_id in kept_ids:
+            if spans and source_id == spans[-1][1]:
+                spans[-1][1] += 1
+            else:
+                spans.append([source_id, source_id + 1])
+        audit.update({
+            "formatVersion": 2,
+            "videoMaterialization": "full_source",
+            "storageMethod": "hardlink",
+            "keptSpans": spans,
+        })
     (episode / "CUT_INFO.json").write_text(json.dumps(audit), encoding="utf-8")
     return episode
 
@@ -538,6 +561,33 @@ def test_preflight_does_not_auto_repair_frame_ids_with_aborted_session(
         "video_frame_id_mismatch:rgbd_head_depth:0",
     }
     assert "repairs" not in json.loads((episode / "CUT_INFO.json").read_text())
+
+
+def test_validation_accepts_virtual_video_and_rejects_wrong_source_mapping(tmp_path: Path) -> None:
+    root = tmp_path / "cleaned"
+    episode = make_cleaned_episode(
+        root,
+        "task/episode_000001",
+        ranges=[[1, 2], [3, 4]],
+        source_frames=5,
+        virtual_video=True,
+    )
+
+    def full_video_probe(path: Path) -> dict:
+        return {**fake_probe(path), "frames": 5}
+
+    checked = validate_episode(root, episode, video_probe=full_video_probe)
+    assert checked.valid
+    assert all(video.frames == 5 for video in checked.videos.values())
+
+    manifest = episode / "manifest.jsonl"
+    rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    rows[2]["videos"]["hand_left"]["source_frame_id"] = 3
+    manifest.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    refresh_audit_fingerprint(episode)
+
+    invalid = validate_episode(root, episode, video_probe=full_video_probe)
+    assert "video_source_frame_id_mismatch:hand_left:1" in invalid.reasons
 
 
 def test_rejects_unverified_nested_timestamp_stitching(tmp_path: Path) -> None:

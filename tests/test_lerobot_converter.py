@@ -214,6 +214,68 @@ def test_load_source_episode_default_task_is_normalized_english_title(tmp_path: 
     assert loaded.task == "pick the egg tart"
 
 
+def test_virtual_source_loads_full_videos_and_decoder_skips_removed_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_source(tmp_path)
+    source_ids = [0, 2, 4]
+    rows = [json.loads(line) for line in (source.path / "manifest.jsonl").read_text().splitlines()]
+    for record_row, source_id in zip(rows[1:4], source_ids, strict=True):
+        for entry in record_row["videos"].values():
+            entry["source_frame_id"] = source_id
+    (source.path / "manifest.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+    (source.path / "CUT_INFO.json").write_text(json.dumps({
+        "formatVersion": 2,
+        "videoMaterialization": "full_source",
+        "sourceFrames": 5,
+    }), encoding="utf-8")
+
+    def probe(path: Path, stream: str) -> converter.VideoSource:
+        return converter.VideoSource(stream, path, 48, 32, 30.0, 5, False)
+
+    loaded = converter.load_source_episode(source.path, "english task", video_probe=probe)
+    assert {video.frames for video in loaded.videos.values()} == {5}
+
+    calls: dict[str, list[int]] = {}
+
+    class Image:
+        def __init__(self, shape):
+            self.shape = shape
+
+    class Reader:
+        def __init__(self, video, _runtime):
+            self.video = video
+            calls[video.stream] = []
+
+        def read_at(self, frame_index):
+            calls[self.video.stream].append(frame_index)
+            channels = 1 if self.video.is_depth else 3
+            return Image((self.video.height, self.video.width, channels))
+
+        def read(self):
+            raise AssertionError("virtual video should not require an end-of-file read")
+
+        def close(self):
+            pass
+
+    class Dataset:
+        def __init__(self):
+            self.frames = []
+
+        def add_frame(self, frame):
+            self.frames.append(frame)
+
+    monkeypatch.setattr(converter, "_VideoReader", Reader)
+    monkeypatch.setattr(converter, "_make_frame", lambda *_args: {"frame": len(dataset.frames)})
+    dataset = Dataset()
+    converter._add_frames(dataset, loaded, {"np": object()})
+
+    assert len(dataset.frames) == 3
+    assert calls and all(indices == source_ids for indices in calls.values())
+
+
 def test_all_source_frames_are_retained_including_single_frame_episode() -> None:
     source = converter.SourceEpisode(Path("episode_1"), 1, "task", 30, {}, [{}, {}, {}], {})
     assert converter.converted_episode_length(source) == 3

@@ -54,12 +54,31 @@ hostname -I
 - 删除区间使用半开范围 `[start, end)`；后端会裁边、排序并合并。
 - 输出位于 cleaned 根下与源根一致的相对路径，含 `CUT_INFO.json`。
 
+### 虚拟剪切与视频存储
+
+`trim` 不再重编码视频。cleaned Episode 的 manifest 只保留选中的记录，`frame_idx` 和 `videos.*.frame_id` 从 0 连续重排；每路视频记录额外写入 `source_frame_id`，指向 cleaned 中完整源视频的真实帧。`CUT_INFO.json` 使用 `formatVersion: 2`、`videoMaterialization: "full_source"` 记录该格式、源帧数、删除区间和保留区间。工作台重新打开 cleaned Episode，以及本仓库的 LeRobot 转换器，都会按该映射跳过删除帧。
+
+cleaned 中的 `videos/` 是完整、自包含的视频目录，不引用 raw 的路径：
+
+- raw 与 cleaned 在同一文件系统时优先使用硬链接，`storageMethod` 为 `hardlink`，不会重复占用视频数据块。
+- 跨文件系统、文件系统不支持硬链接或创建硬链接失败时自动使用真实复制，`storageMethod` 为 `copy`；同一 Episode 两种方式并存时为 `mixed`。
+- 不使用符号链接。只传 cleaned 时，`rsync` 和 `scp` 都会把硬链接目录项当作普通文件读取，服务器不需要访问机器人上的 raw；使用 `scp` 时加 `-p` 保留审计指纹依赖的时间元数据。
+- 硬链接建立后可以删除 raw 的文件名，cleaned 文件仍然有效；但不能原地修改 raw 视频，因为 raw 和 cleaned 此时指向同一 inode。采集结束后的 raw 视频应视为不可变文件。
+
+推荐通过有线网络保留元数据传输整个 cleaned 根：
+
+```bash
+rsync -a --info=progress2 /path/to/capture_cleaned/ user@server:/path/to/capture_cleaned/
+```
+
+不需要 `--copy-links` 或 `-L`。仅传 cleaned 时也不需要 `-H`；服务器会正常写入一份独立视频内容，并可在没有 raw 目录的情况下完成默认校验和 LeRobot 转换。
+
 ## 任务队列
 
 - 任务仅缓存在当前服务进程内，最多排队 256 个；服务重启不会恢复或重放任务。
 - 默认和推荐并发为 2，可在页面队列面板调整为 1–4。
 - 相同输出 Episode 在排队或运行时不能重复提交；不同目标可并行发布。
-- 所有运行任务共享 70% CPU 硬预算，每个任务启动时获得固定 FFmpeg slot 配额。
+- Web 服务保留 70% CPU 亲和性预算；虚拟剪切不启动 FFmpeg，主要工作是改写 manifest、建立硬链接或跨盘复制。
 
 - cleaned 根的 `CUT_HISTORY.csv` 只追加历史记录；覆盖不会改写旧记录。
 
@@ -92,6 +111,8 @@ data-autopro-light convert \
   --output-root /path/to/lerobot \
   --preflight-only
 ```
+
+cleaned Episode 必须有可复验的 `CUT_INFO.json`。验证包括审计路径、模式、删除区间、帧数、完成时间、输出指纹、manifest 结构、连续帧号、有限数值、EEF/关节/control 结构，以及所有有效视频流的帧数、FPS、尺寸和路径约束。虚拟剪切还会验证完整视频帧数等于 `sourceFrames`，且所有流的 `source_frame_id` 与保留区间一致。`rgbd_head_color`、`hand_left`、`hand_right` 是必需彩色流；深度和其他有效相机流也会纳入校验和转换。旧的实体剪切输出继续兼容。
 
 预检默认自动修复唯一错误为 `video_frame_id_mismatch` 的旧 `no_trim` Episode，修复前
 在输出根的 `.preflight-frame-id-backups/` 创建 ZIP 备份，修复后只重新验证命中的
@@ -310,7 +331,7 @@ data-autopro-light promote-aux-videos \
 
 转换始终增量执行。owner 已提交但 hybrid 派生失败时，下一次运行只重建低维 hybrid 数据，不重新编码 owner 视频。重复输入是 no-op；源 Episode 缺失、改名、内容变化，或三路训练视频 schema 不一致时会停止对应任务。旧 v1/v2（包括 14-D 和 20-D）输出不能原位追加，必须使用新的输出根。
 
-cleaned Episode 必须有可复验的 `CUT_INFO.json`。验证覆盖审计路径、裁剪区间、输出指纹、manifest、连续帧、有限 joint/EEF 数值和所有有效视频流的逐帧解码。旧的多保留区间输出若没有 `timestampRewriteVersion` 会以 `unverified_nested_timestamp_stitching` 跳过。
+旧的多保留区间输出若没有 `timestampRewriteVersion` 会以 `unverified_nested_timestamp_stitching` 跳过，需从工作台重新剪切生成；转换器不会改写这类 cleaned 数据。
 
 相对软链接要求整个 `OUT` bundle 一起移动或使用保留链接的复制方式（例如 `rsync -a`）。只复制 `body_joint_eef` 子目录会断链；发布到 Hugging Face Hub 或单目录归档前应先物化链接。标准读取示例：
 

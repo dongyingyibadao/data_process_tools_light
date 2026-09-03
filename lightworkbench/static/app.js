@@ -275,11 +275,31 @@ function setStream(stream) {
 function clampFrame(value) {
   return Math.max(0, Math.min(state.detail.frameCount - 1, Math.round(Number(value) || 0)));
 }
+function sourceFrameForOutput(value) {
+  const frame = clampFrame(value);
+  return state.detail.sourceFrameIds?.[frame] ?? frame;
+}
+function outputFrameAtOrAfterSource(sourceFrame) {
+  const mapping = state.detail.sourceFrameIds;
+  if (!mapping) return clampFrame(sourceFrame);
+  let low = 0;
+  let high = mapping.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (mapping[middle] < sourceFrame) low = middle + 1;
+    else high = middle;
+  }
+  return low < mapping.length ? low : null;
+}
+function seekVideoToOutputFrame(frame) {
+  const video = $("#video");
+  const sourceFrame = sourceFrameForOutput(frame);
+  video.currentTime = Math.min(sourceFrame / state.detail.fps, Math.max(0, (video.duration || Infinity) - .0001));
+}
 function seekFrame(value) {
   if (!state.detail) return;
   const frame = clampFrame(value);
-  const video = $("#video");
-  if (state.stream) video.currentTime = Math.min(frame / state.detail.fps, Math.max(0, (video.duration || Infinity) - .0001));
+  if (state.stream) seekVideoToOutputFrame(frame);
   updateFrame(frame, true);
 }
 function updateFrame(value, controls = false) {
@@ -319,7 +339,19 @@ function lastKeptFrame() {
 function handleVideoProgress(mediaTime) {
   if (!state.detail) return;
   const video = $("#video");
-  let frame = clampFrame(Math.floor(mediaTime * state.detail.fps + .001));
+  const physicalFrame = Math.floor(mediaTime * state.detail.fps + .001);
+  let frame = outputFrameAtOrAfterSource(physicalFrame);
+  if (frame === null) {
+    frame = state.detail.frameCount - 1;
+    if (!video.paused) video.pause();
+    seekVideoToOutputFrame(frame);
+  } else if (
+    state.detail.sourceFrameIds
+    && state.detail.sourceFrameIds[frame] !== physicalFrame
+    && !video.paused
+  ) {
+    seekVideoToOutputFrame(frame);
+  }
   if (state.preview && state.nextKeptFrame !== null && !video.paused) {
     const desired = keptFrameAtOrAfter(frame);
     if (desired === null) {
@@ -327,12 +359,12 @@ function handleVideoProgress(mediaTime) {
       state.nextKeptFrame = null;
       video.pause();
       if (last !== null) {
-        video.currentTime = last / state.detail.fps;
+        seekVideoToOutputFrame(last);
         frame = last;
       }
     } else if (desired !== frame) {
       state.nextKeptFrame = desired;
-      video.currentTime = desired / state.detail.fps;
+      seekVideoToOutputFrame(desired);
       frame = desired;
     } else {
       state.nextKeptFrame = desired;

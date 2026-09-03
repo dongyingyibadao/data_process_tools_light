@@ -248,6 +248,32 @@ def _kept_span_count(ranges: Iterable[tuple[int, int]], frame_count: int) -> int
     return count
 
 
+def _kept_indices(ranges: Iterable[tuple[int, int]], frame_count: int) -> list[int]:
+    removed = iter(ranges)
+    current = next(removed, None)
+    result: list[int] = []
+    for index in range(frame_count):
+        while current is not None and index >= current[1]:
+            current = next(removed, None)
+        if current is None or index < current[0]:
+            result.append(index)
+    return result
+
+
+def _spans_from_indices(indices: list[int]) -> list[tuple[int, int]]:
+    if not indices:
+        return []
+    result: list[tuple[int, int]] = []
+    start = previous = indices[0]
+    for index in indices[1:]:
+        if index != previous + 1:
+            result.append((start, previous + 1))
+            start = index
+        previous = index
+    result.append((start, previous + 1))
+    return result
+
+
 def _read_task_meta(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -343,11 +369,23 @@ def _audit(
         result.reasons.append("cut_info_frame_counts_invalid")
         source_frames = output_frames = 0
     ranges, ranges_valid = _ranges(value.get("removedRanges"), source_frames)
+    is_virtual = value.get("formatVersion") == 2 and value.get("videoMaterialization") == "full_source"
+    if value.get("formatVersion") is not None and value.get("formatVersion") != 2:
+        result.reasons.append("cut_info_format_version_unsupported")
+    if value.get("videoMaterialization") is not None and not is_virtual:
+        result.reasons.append("cut_info_video_materialization_unsupported")
+    if is_virtual and value.get("storageMethod") not in {"hardlink", "copy", "mixed"}:
+        result.reasons.append("cut_info_storage_method_invalid")
     if not ranges_valid:
         result.reasons.append("cut_info_ranges_invalid")
     elif source_frames and output_frames != source_frames - sum(end - start for start, end in ranges):
         result.reasons.append("cut_info_frame_counts_mismatch")
-    if mode == "no_trim" and (ranges or source_frames != output_frames):
+    if is_virtual and ranges_valid:
+        kept, kept_valid = _ranges(value.get("keptSpans"), source_frames)
+        expected_kept = _spans_from_indices(_kept_indices(ranges, source_frames))
+        if not kept_valid or kept != expected_kept:
+            result.reasons.append("cut_info_kept_spans_mismatch")
+    if mode == "no_trim" and not is_virtual and (ranges or source_frames != output_frames):
         result.reasons.append("cut_info_no_trim_mismatch")
     if not _parse_completed(value.get("completedAtUtc")):
         result.reasons.append("cut_info_completion_invalid")
@@ -479,7 +517,19 @@ def _validate_videos(
     fps: float,
     result: EpisodeValidation,
     probe: VideoProbe,
+    audit: dict[str, Any],
 ) -> None:
+    source_frames = audit.get("sourceFrames")
+    is_virtual = (
+        audit.get("formatVersion") == 2
+        and audit.get("videoMaterialization") == "full_source"
+        and isinstance(source_frames, int)
+        and not isinstance(source_frames, bool)
+    )
+    ranges, ranges_valid = _ranges(audit.get("removedRanges"), source_frames) if is_virtual else ([], False)
+    expected_source_ids = _kept_indices(ranges, source_frames) if ranges_valid else []
+    if is_virtual and len(expected_source_ids) != len(frames):
+        result.reasons.append("video_source_frame_map_mismatch")
     names: set[str] = set()
     for row in frames:
         videos = row.get("videos")
@@ -507,6 +557,12 @@ def _validate_videos(
             if not isinstance(entry, dict) or entry.get("frame_id") != expected:
                 result.reasons.append(f"video_frame_id_mismatch:{name}:{expected}")
                 break
+            if is_virtual and (
+                expected >= len(expected_source_ids)
+                or entry.get("source_frame_id") != expected_source_ids[expected]
+            ):
+                result.reasons.append(f"video_source_frame_id_mismatch:{name}:{expected}")
+                break
         relative = next(iter(referenced))
         try:
             video_path = resolve_video(episode, relative)
@@ -522,7 +578,8 @@ def _validate_videos(
         video_fps = float(checked.get("fps") or 0)
         width = int(checked.get("width") or 0)
         height = int(checked.get("height") or 0)
-        if frames_decoded != len(frames):
+        expected_video_frames = source_frames if is_virtual else len(frames)
+        if frames_decoded != expected_video_frames:
             result.reasons.append(f"video_frame_count_mismatch:{name}")
         if not math.isclose(video_fps, fps, abs_tol=0.05):
             result.reasons.append(f"video_fps_mismatch:{name}")
@@ -604,7 +661,7 @@ def validate_episode(
             result.reasons.append(f"frame_task_mismatch:{expected}")
     if result.fps > 0:
         decoded_probe = video_probe or (lambda video: probe_video(video, decoded=True))
-        _validate_videos(path, frames, result.fps, result, decoded_probe)
+        _validate_videos(path, frames, result.fps, result, decoded_probe, audit)
 
     # Preserve the first occurrence order while keeping reports compact.
     result.reasons = list(dict.fromkeys(result.reasons))

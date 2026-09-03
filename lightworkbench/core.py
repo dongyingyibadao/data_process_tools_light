@@ -176,6 +176,7 @@ class ManifestData:
     task: str
     stream_paths: dict[str, str]
     errors: tuple[str, ...]
+    source_frame_ids: tuple[int, ...] | None = None
 
 
 def read_manifest(episode: Path) -> ManifestData:
@@ -186,6 +187,7 @@ def read_manifest(episode: Path) -> ManifestData:
     count = 0
     paths: dict[str, set[str]] = {}
     missing: dict[str, int] = {}
+    source_frame_ids: list[int | None] = []
     errors: list[str] = []
     try:
         with manifest.open("r", encoding="utf-8", errors="strict") as handle:
@@ -208,6 +210,7 @@ def read_manifest(episode: Path) -> ManifestData:
                     videos = row.get("videos")
                     if not isinstance(videos, dict):
                         errors.append(f"第 {count} 帧缺少 videos")
+                        source_frame_ids.append(None)
                     else:
                         known = set(paths) | set(videos)
                         for name in known:
@@ -217,6 +220,23 @@ def read_manifest(episode: Path) -> ManifestData:
                                 paths.setdefault(name, set()).add(path)
                             else:
                                 missing[name] = missing.get(name, 0) + 1
+                        active_entries = [
+                            entry for entry in videos.values()
+                            if isinstance(entry, dict) and isinstance(entry.get("path"), str) and entry["path"]
+                        ]
+                        mapped = [entry.get("source_frame_id") for entry in active_entries]
+                        present = [value for value in mapped if value is not None]
+                        if present:
+                            if len(present) != len(mapped) or any(
+                                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                                for value in present
+                            ) or len(set(present)) != 1:
+                                errors.append(f"第 {count} 帧 source_frame_id 非法或跨视频流不一致")
+                                source_frame_ids.append(None)
+                            else:
+                                source_frame_ids.append(present[0])
+                        else:
+                            source_frame_ids.append(None)
                     count += 1
     except (OSError, UnicodeError) as exc:
         errors.append(f"manifest 无法读取: {exc}")
@@ -244,7 +264,32 @@ def read_manifest(episode: Path) -> ManifestData:
                 task = str(meta.get("task_description") or meta.get("description") or "")
         except (OSError, json.JSONDecodeError):
             errors.append("task_meta.json 缺失或损坏")
-    return ManifestData(count, fps, task, result, tuple(errors))
+    frame_map: tuple[int, ...] | None = None
+    if any(value is not None for value in source_frame_ids):
+        if any(value is None for value in source_frame_ids):
+            errors.append("source_frame_id 仅覆盖部分 manifest 帧")
+        else:
+            frame_map = tuple(int(value) for value in source_frame_ids if value is not None)
+            if any(current <= previous for previous, current in zip(frame_map, frame_map[1:])):
+                errors.append("source_frame_id 必须严格递增")
+    return ManifestData(count, fps, task, result, tuple(errors), frame_map)
+
+
+def virtual_video_source_frames(episode: Path) -> int | None:
+    try:
+        audit = json.loads((episode / "CUT_INFO.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(audit, dict)
+        or audit.get("formatVersion") != 2
+        or audit.get("videoMaterialization") != "full_source"
+    ):
+        return None
+    source_frames = audit.get("sourceFrames")
+    if isinstance(source_frames, bool) or not isinstance(source_frames, int) or source_frames <= 0:
+        return None
+    return source_frames
 
 
 def probe_video(path: Path, *, decoded: bool = False) -> dict[str, Any]:
@@ -304,8 +349,16 @@ class EpisodeService:
         episode = resolve_episode(root, relative)
         manifest_future = self._pool.submit(read_manifest, episode)
         meta = manifest_future.result()
+        virtual_source_frames = virtual_video_source_frames(episode)
+        expected_video_frames = virtual_source_frames or meta.frame_count
         futures = {}
         pre_errors = list(meta.errors)
+        if virtual_source_frames is not None and meta.source_frame_ids is None:
+            pre_errors.append("虚拟剪切 manifest 缺少 source_frame_id")
+        if virtual_source_frames is None and meta.source_frame_ids is not None:
+            pre_errors.append("manifest 含 source_frame_id，但 CUT_INFO 不是受支持的虚拟剪切格式")
+        if meta.source_frame_ids and meta.source_frame_ids[-1] >= expected_video_frames:
+            pre_errors.append("source_frame_id 超出完整视频范围")
         for name, value in meta.stream_paths.items():
             try:
                 path = resolve_video(episode, value)
@@ -317,10 +370,10 @@ class EpisodeService:
         for future in as_completed(futures):
             name, value = futures[future]
             probe = future.result()
-            valid = bool(probe.get("valid")) and probe.get("frames") == meta.frame_count and math.isclose(float(probe.get("fps") or 0), meta.fps, abs_tol=0.05)
+            valid = bool(probe.get("valid")) and probe.get("frames") == expected_video_frames and math.isclose(float(probe.get("fps") or 0), meta.fps, abs_tol=0.05)
             error = probe.get("error")
-            if probe.get("valid") and probe.get("frames") != meta.frame_count:
-                error = f"视频 {probe.get('frames')} 帧，manifest {meta.frame_count} 帧"
+            if probe.get("valid") and probe.get("frames") != expected_video_frames:
+                error = f"视频 {probe.get('frames')} 帧，预期 {expected_video_frames} 帧"
             elif probe.get("valid") and not math.isclose(float(probe.get("fps") or 0), meta.fps, abs_tol=0.05):
                 error = f"视频 FPS {probe.get('fps')}，manifest FPS {meta.fps}"
             codec = probe.get("codec")
@@ -338,6 +391,9 @@ class EpisodeService:
             "frameCount": meta.frame_count,
             "fps": meta.fps,
             "durationSec": meta.frame_count / meta.fps,
+            "videoFrameCount": expected_video_frames,
+            "videoMaterialization": "full_source" if virtual_source_frames is not None else "materialized",
+            "sourceFrameIds": list(meta.source_frame_ids) if meta.source_frame_ids is not None else None,
             "task": meta.task,
             "streams": streams,
             "issues": pre_errors + [f"{item['name']}: {item['error']}" for item in streams if not item["valid"]],

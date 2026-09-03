@@ -398,6 +398,23 @@ def _resolve_video_path(episode: Path, relative: str) -> Path:
     return result
 
 
+def _virtual_source_frames(episode: Path) -> int | None:
+    try:
+        audit = json.loads((episode / "CUT_INFO.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(audit, dict)
+        or audit.get("formatVersion") != 2
+        or audit.get("videoMaterialization") != "full_source"
+    ):
+        return None
+    source_frames = audit.get("sourceFrames")
+    if isinstance(source_frames, bool) or not isinstance(source_frames, int) or source_frames <= 0:
+        raise ValueError(f"{episode / 'CUT_INFO.json'}: invalid virtual sourceFrames")
+    return source_frames
+
+
 def load_source_episode(
     path: Path,
     task: str | None = None,
@@ -412,6 +429,7 @@ def load_source_episode(
     if not manifest.is_file() or not metadata_path.is_file():
         raise ValueError(f"{path}: manifest.jsonl or task_meta.json is missing")
     header, records = load_jsonl(manifest)
+    virtual_source_frames = _virtual_source_frames(path)
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -476,6 +494,27 @@ def load_source_episode(
             and isinstance(entry.get("path"), str)
             and bool(entry["path"])
         )
+        mapped_ids: set[int] = set()
+        for stream, entry in videos.items():
+            if not isinstance(entry, Mapping) or not isinstance(entry.get("path"), str) or not entry["path"]:
+                continue
+            frame_id = entry.get("frame_id")
+            if isinstance(frame_id, bool) or frame_id != index:
+                raise ValueError(f"{label}: non-contiguous videos.{stream}.frame_id")
+            source_frame_id = entry.get("source_frame_id")
+            if virtual_source_frames is None:
+                if source_frame_id is not None:
+                    raise ValueError(f"{label}: source_frame_id requires CUT_INFO virtual video format")
+            elif (
+                isinstance(source_frame_id, bool)
+                or not isinstance(source_frame_id, int)
+                or not 0 <= source_frame_id < virtual_source_frames
+            ):
+                raise ValueError(f"{label}: invalid videos.{stream}.source_frame_id")
+            else:
+                mapped_ids.add(source_frame_id)
+        if virtual_source_frames is not None and len(mapped_ids) != 1:
+            raise ValueError(f"{label}: source_frame_id differs across video streams")
     missing = set(REQUIRED_VIDEO_STREAMS) - active_streams
     if missing:
         raise ValueError(f"{manifest}: missing required video streams {sorted(missing)}")
@@ -483,6 +522,7 @@ def load_source_episode(
     video_sources: dict[str, VideoSource] = {}
     for stream in ordered_video_streams(active_streams):
         paths: set[str] = set()
+        previous_source_frame_id = -1
         for index, record in enumerate(records):
             entry = record["videos"].get(stream)
             if not isinstance(entry, Mapping) or not isinstance(entry.get("path"), str) or not entry["path"]:
@@ -490,6 +530,11 @@ def load_source_episode(
             frame_id = entry.get("frame_id")
             if isinstance(frame_id, bool) or not isinstance(frame_id, int):
                 raise ValueError(f"{manifest}:frame {index}: invalid videos.{stream}.frame_id")
+            if virtual_source_frames is not None:
+                source_frame_id = entry.get("source_frame_id")
+                if source_frame_id <= previous_source_frame_id:
+                    raise ValueError(f"{manifest}: videos.{stream}.source_frame_id is not strictly increasing")
+                previous_source_frame_id = source_frame_id
             paths.add(entry["path"])
         if len(paths) != 1:
             raise ValueError(f"{manifest}: videos.{stream}.path changes within episode")
@@ -501,8 +546,9 @@ def load_source_episode(
             stream, video_path, inspected.width, inspected.height, inspected.fps,
             inspected.frames, is_depth_stream(stream),
         )
-        if video.frames != len(records):
-            raise ValueError(f"{video.path}: {video.frames} frames but manifest has {len(records)}")
+        expected_video_frames = virtual_source_frames or len(records)
+        if video.frames != expected_video_frames:
+            raise ValueError(f"{video.path}: {video.frames} frames but expected {expected_video_frames}")
         if not math.isclose(video.fps, fps, rel_tol=0, abs_tol=0.05):
             raise ValueError(f"{video.path}: fps {video.fps} differs from manifest fps {fps}")
         video_sources[stream] = video
@@ -938,6 +984,7 @@ class _VideoReader:
         self.capture = None
         self.container = None
         self.frames = None
+        self.next_frame_index = 0
         if source.is_depth:
             self.container = runtime["av"].open(str(source.path))
             self.frames = iter(self.container.decode(video=0))
@@ -950,13 +997,26 @@ class _VideoReader:
     def read(self) -> Any | None:
         if self.source.is_depth:
             try:
-                return next(self.frames).to_ndarray(format="gray16le")[:, :, None]
+                image = next(self.frames).to_ndarray(format="gray16le")[:, :, None]
             except StopIteration:
                 return None
-        ok, bgr = self.capture.read()
-        if not ok or bgr is None:
-            return None
-        return self.runtime["cv2"].cvtColor(bgr, self.runtime["cv2"].COLOR_BGR2RGB)
+        else:
+            ok, bgr = self.capture.read()
+            if not ok or bgr is None:
+                return None
+            image = self.runtime["cv2"].cvtColor(bgr, self.runtime["cv2"].COLOR_BGR2RGB)
+        self.next_frame_index += 1
+        return image
+
+    def read_at(self, frame_index: int) -> Any | None:
+        if frame_index < self.next_frame_index:
+            raise RuntimeError(f"video frame mapping moved backwards at {frame_index}")
+        image = None
+        while self.next_frame_index <= frame_index:
+            image = self.read()
+            if image is None:
+                return None
+        return image
 
     def close(self) -> None:
         if self.capture is not None:
@@ -989,7 +1049,7 @@ def _make_frame(
         "observation.target_eef_pose": np.asarray(target_pose, dtype=np.float32),
         "observation.current_height_z": np.asarray([current_height], dtype=np.float32),
         "observation.target_height_z": np.asarray([target_height], dtype=np.float32),
-        "source.frame_index": np.asarray([record["frame_idx"]], dtype=np.int64),
+        "source.frame_index": np.asarray([_record_source_frame_id(record)], dtype=np.int64),
         "source.timestamp_ns": np.asarray([record["t_ns"]], dtype=np.int64),
         "source.episode_id": np.asarray([episode.source_episode_id], dtype=np.int64),
         "action": np.asarray(
@@ -1003,6 +1063,19 @@ def _make_frame(
         ),
         "task": episode.task,
     }
+
+
+def _record_source_frame_id(record: Mapping[str, Any]) -> int:
+    videos = record.get("videos")
+    if isinstance(videos, Mapping):
+        values = {
+            entry.get("source_frame_id")
+            for entry in videos.values()
+            if isinstance(entry, Mapping) and entry.get("source_frame_id") is not None
+        }
+        if len(values) == 1:
+            return int(next(iter(values)))
+    return int(record["frame_idx"])
 
 
 def _add_frames(
@@ -1023,12 +1096,23 @@ def _add_frames(
             )
         for index in range(converted_episode_length(episode)):
             images: dict[str, Any] = {}
+            source_frame_ids = {
+                stream: episode.records[index]["videos"][stream].get("source_frame_id", index)
+                for stream in streams
+            }
             futures = (
-                {stream: pool.submit(readers[stream].read) for stream in streams}
+                {
+                    stream: pool.submit(readers[stream].read_at, source_frame_ids[stream])
+                    for stream in streams
+                }
                 if pool is not None else None
             )
             for stream in streams:
-                image = futures[stream].result() if futures is not None else readers[stream].read()
+                image = (
+                    futures[stream].result()
+                    if futures is not None
+                    else readers[stream].read_at(source_frame_ids[stream])
+                )
                 if image is None:
                     raise RuntimeError(f"{episode.path}: {stream} ended before frame {index}")
                 video = episode.videos[stream]
@@ -1037,15 +1121,20 @@ def _add_frames(
                     raise RuntimeError(f"{episode.path}: {stream} frame {index} shape {image.shape}, expected {expected}")
                 images[video_key(stream)] = image
             dataset.add_frame(_make_frame(episode, index, images, runtime["np"], action_mode))
-        # All manifest frames were consumed; prove there are no extras.
-        futures = (
-            {stream: pool.submit(readers[stream].read) for stream in streams}
-            if pool is not None else None
+        is_virtual = any(
+            episode.records[-1]["videos"][stream].get("source_frame_id") is not None
+            for stream in streams
         )
-        for stream, reader in readers.items():
-            extra = futures[stream].result() if futures is not None else reader.read()
-            if extra is not None:
-                raise RuntimeError(f"{episode.path}: {stream} has frames beyond manifest")
+        if not is_virtual:
+            # Materialized videos must end exactly after the final manifest frame.
+            futures = (
+                {stream: pool.submit(readers[stream].read) for stream in streams}
+                if pool is not None else None
+            )
+            for stream, reader in readers.items():
+                extra = futures[stream].result() if futures is not None else reader.read()
+                if extra is not None:
+                    raise RuntimeError(f"{episode.path}: {stream} has frames beyond manifest")
     finally:
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)

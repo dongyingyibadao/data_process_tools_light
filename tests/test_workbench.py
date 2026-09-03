@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import errno
 import json
 import os
 import shutil
@@ -15,7 +16,7 @@ from lightworkbench.app import app, browse_service
 from lightworkbench import config
 from lightworkbench.config import RESOURCES
 from lightworkbench.core import BrowseService, WorkbenchError, probe_video
-from lightworkbench.operations import normalize_ranges
+from lightworkbench.operations import link_or_copy_file, normalize_ranges
 from lightworkbench.validation import validate_episode
 
 
@@ -170,7 +171,7 @@ def test_ranges_trim_copy_overwrite_and_csv(tmp_path: Path) -> None:
     root = tmp_path / "raw"
     output = tmp_path / "cleaned"
     relative = "289/2026-08-30/task/episode_000001"
-    make_episode(root, relative)
+    source_episode, streams = make_episode(root, relative)
     assert normalize_ranges([[-2, 2], [1, 4], [6, 20]], 8) == [(0, 4), (6, 8)]
 
     created = submit(root, output, relative, "trim", [[0, 2], [6, 8]])
@@ -185,10 +186,22 @@ def test_ranges_trim_copy_overwrite_and_csv(tmp_path: Path) -> None:
     records = [row for row in manifest_rows if not isinstance(row.get("_type"), str)]
     assert [row["frame_idx"] for row in records] == list(range(4))
     assert all(row["videos"]["head_right"]["frame_id"] == row["frame_idx"] for row in records)
+    assert [row["videos"]["head_right"]["source_frame_id"] for row in records] == [2, 3, 4, 5]
     for video in (destination / "videos").rglob("*.mp4"):
-        assert probe_video(video, decoded=True)["frames"] == 4
+        assert probe_video(video, decoded=True)["frames"] == 8
+    for relative_video in streams.values():
+        assert (source_episode / relative_video).stat().st_ino == (destination / relative_video).stat().st_ino
     info = json.loads((destination / "CUT_INFO.json").read_text(encoding="utf-8"))
     assert info["removedRanges"] == [[0, 2], [6, 8]]
+    assert info["keptSpans"] == [[2, 6]]
+    assert info["formatVersion"] == 2
+    assert info["videoMaterialization"] == "full_source"
+    assert info["storageMethod"] == "hardlink"
+    reopened = detail(output, relative)
+    assert reopened["valid"] is True
+    assert reopened["frameCount"] == 4
+    assert reopened["videoFrameCount"] == 8
+    assert reopened["sourceFrameIds"] == [2, 3, 4, 5]
 
     conflict = submit(root, output, relative, "no_trim")
     assert conflict.status_code == 409
@@ -286,6 +299,35 @@ def test_converter_preflight_failure_never_publishes_to_cleaned(tmp_path: Path) 
     assert "required_video_missing:hand_left" in finished["error"]
     assert not (output / relative).exists()
     assert not list(tmp_path.glob(".cleaned.lightworkbench-staging-*"))
+
+
+def test_video_materialization_falls_back_to_a_real_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.mp4"
+    destination = tmp_path / "other" / "destination.mp4"
+    source.write_bytes(b"video-data")
+
+    def cross_device_link(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(os, "link", cross_device_link)
+    assert link_or_copy_file(source, destination) == "copy"
+    assert destination.read_bytes() == source.read_bytes()
+    assert destination.stat().st_ino != source.stat().st_ino
+
+
+def test_hardlinked_cleaned_file_survives_raw_name_removal(tmp_path: Path) -> None:
+    source = tmp_path / "raw" / "source.mp4"
+    destination = tmp_path / "cleaned" / "source.mp4"
+    source.parent.mkdir()
+    source.write_bytes(b"self-contained-video")
+
+    assert link_or_copy_file(source, destination) == "hardlink"
+    assert not destination.is_symlink()
+    source.unlink()
+
+    assert destination.read_bytes() == b"self-contained-video"
 
 
 def test_reject_too_short_stale_source_and_overlapping_output(tmp_path: Path) -> None:

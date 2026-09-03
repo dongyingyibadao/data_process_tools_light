@@ -22,6 +22,7 @@ from .core import (
     EpisodeService,
     WorkbenchError,
     normalize_root,
+    probe_video,
     read_manifest,
     resolve_episode,
     resolve_video,
@@ -40,6 +41,8 @@ FINGERPRINT_VERSION = "sha256-relative-path-size-mtime-ns-v1"
 FINGERPRINT_EXCLUDES = ("CUT_INFO.json",)
 TIMESTAMP_REWRITE_VERSION = 2
 MANIFEST_NORMALIZATION_VERSION = 1
+VIRTUAL_CUT_FORMAT_VERSION = 2
+FULL_SOURCE_VIDEO = "full_source"
 
 
 class QueueFullError(WorkbenchError):
@@ -88,34 +91,56 @@ def kept_spans(removed: list[tuple[int, int]], frame_count: int) -> list[tuple[i
     return spans
 
 
+def spans_from_indices(indices: list[int]) -> list[tuple[int, int]]:
+    if not indices:
+        return []
+    spans: list[tuple[int, int]] = []
+    start = previous = indices[0]
+    for index in indices[1:]:
+        if index != previous + 1:
+            spans.append((start, previous + 1))
+            start = index
+        previous = index
+    spans.append((start, previous + 1))
+    return spans
 
 
-def trim_video(source: Path, destination: Path, spans: list[tuple[int, int]], fps: float,
-               stream_name: str, pixel_format: str, threads: int) -> None:
+def removed_from_kept(spans: list[tuple[int, int]], frame_count: int) -> list[tuple[int, int]]:
+    removed: list[tuple[int, int]] = []
+    cursor = 0
+    for start, end in spans:
+        if cursor < start:
+            removed.append((cursor, start))
+        cursor = end
+    if cursor < frame_count:
+        removed.append((cursor, frame_count))
+    return removed
+
+
+def link_or_copy_file(source: Path, destination: Path) -> str:
+    """Materialize a regular file without introducing transport-unsafe symlinks."""
+
     destination.parent.mkdir(parents=True, exist_ok=True)
-    filters = [f"[0:v]trim=start_frame={start}:end_frame={end},setpts=PTS-STARTPTS[v{index}]" for index, (start, end) in enumerate(spans)]
-    if len(spans) == 1:
-        filters.append(f"[v0]setpts=N/{fps}/TB[outv]")
-    else:
-        labels = "".join(f"[v{index}]" for index in range(len(spans)))
-        filters.append(f"{labels}concat=n={len(spans)}:v=1:a=0,setpts=N/{fps}/TB[outv]")
-    nice = shutil.which("nice")
-    command = ([nice, "-n", "10"] if nice else []) + [
-        FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-filter_threads", "1",
-        "-filter_complex_threads", "1", "-i", str(source), "-filter_complex", ";".join(filters),
-        "-map", "[outv]", "-an", "-r", f"{fps:.8f}",
-    ]
-    if "depth" in stream_name.casefold() or pixel_format.startswith("gray") or destination.suffix.casefold() == ".mkv":
-        command += ["-c:v", "ffv1"]
-    else:
-        command += ["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p"]
-        if destination.suffix.casefold() == ".mp4":
-            command += ["-movflags", "+faststart"]
-    command += ["-threads", str(max(1, threads)), str(destination)]
     try:
-        subprocess.run(command, check=True, timeout=3600)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise WorkbenchError(f"FFmpeg 剪切失败: {stream_name}") from exc
+        os.link(source, destination)
+        return "hardlink"
+    except OSError:
+        shutil.copy2(source, destination)
+        return "copy"
+
+
+def materialize_video_tree(source: Path, destination: Path) -> str:
+    methods: set[str] = set()
+    for item in source.rglob("*"):
+        relative = item.relative_to(source)
+        target = destination / relative
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif item.is_file():
+            methods.add(link_or_copy_file(item, target))
+    if not methods:
+        raise WorkbenchError("源 Episode 的 videos 目录为空")
+    return next(iter(methods)) if len(methods) == 1 else "mixed"
 
 
 def _finite_number(value: Any) -> bool:
@@ -207,7 +232,7 @@ def _shift_record_times(row: dict[str, Any], shift_seconds: float,
 
 
 def rewrite_manifest(source: Path, destination: Path, keep: set[int], fps: float,
-                     audit: dict[str, Any]) -> int:
+                     audit: dict[str, Any], *, virtual_video: bool = False) -> int:
     source_index = 0
     output_index = 0
     shifts, first_output_wall = _kept_span_shifts(source, keep, fps)
@@ -238,7 +263,10 @@ def rewrite_manifest(source: Path, destination: Path, keep: set[int], fps: float
                 if isinstance(videos, dict):
                     for entry in videos.values():
                         if isinstance(entry, dict):
+                            physical_frame_id = entry.get("source_frame_id", source_index)
                             entry["frame_id"] = output_index
+                            if virtual_video:
+                                entry["source_frame_id"] = physical_frame_id
                             entry["is_repeat"] = False
                             entry["frames_dropped"] = 0
                 json.dump(row, dst, ensure_ascii=False, separators=(",", ":"))
@@ -560,8 +588,8 @@ class OperationManager:
         expected = str(request.get("sourceToken") or "")
         if not expected or detail["sourceToken"] != expected:
             raise ConflictError("源数据已变化，请重新打开 Episode")
-        removed = normalize_ranges(request.get("ranges") or [], detail["frameCount"]) if mode == "trim" else []
-        spans = kept_spans(removed, detail["frameCount"])
+        requested_removed = normalize_ranges(request.get("ranges") or [], detail["frameCount"]) if mode == "trim" else []
+        spans = kept_spans(requested_removed, detail["frameCount"])
         output_frames = sum(end - start for start, end in spans)
         if output_frames < 2:
             raise WorkbenchError("剪切后必须至少保留两帧")
@@ -584,10 +612,16 @@ class OperationManager:
             except (OSError, ValueError, json.JSONDecodeError):
                 revision = 1
 
+        source_frame_ids = detail.get("sourceFrameIds") or list(range(detail["frameCount"]))
+        kept_source_ids = [source_frame_ids[index] for start, end in spans for index in range(start, end)]
+        physical_source_frames = int(detail.get("videoFrameCount") or detail["frameCount"])
+        physical_kept_spans = spans_from_indices(kept_source_ids)
+        removed = removed_from_kept(physical_kept_spans, physical_source_frames)
+        source_is_virtual = detail.get("videoMaterialization") == FULL_SOURCE_VIDEO
         audit = {
             "operationId": state.id, "revision": revision, "overwrittenOperationId": overwritten_id or None,
             "mode": mode, "sourceRoot": str(root), "episode": relative, "operator": operator,
-            "removedRanges": [list(item) for item in removed], "sourceFrames": detail["frameCount"],
+            "removedRanges": [list(item) for item in removed], "sourceFrames": physical_source_frames,
             "outputFrames": output_frames, "sourceToken": expected, "completedAtUtc": None,
             "fingerprintVersion": FINGERPRINT_VERSION,
             "fingerprintExcludes": list(FINGERPRINT_EXCLUDES),
@@ -603,33 +637,59 @@ class OperationManager:
                     raise WorkbenchError("no_trim manifest 输出帧数不一致")
                 audit["manifestNormalizationVersion"] = MANIFEST_NORMALIZATION_VERSION
                 audit["normalizedFields"] = ["frame_idx", "videos.*.frame_id"]
+                if source_is_virtual:
+                    audit.update({
+                        "formatVersion": VIRTUAL_CUT_FORMAT_VERSION,
+                        "videoMaterialization": FULL_SOURCE_VIDEO,
+                        "storageMethod": "copy",
+                        "keptSpans": [list(item) for item in physical_kept_spans],
+                        "inheritedVirtualCut": True,
+                    })
             else:
-                self._update(state, 0.12, "正在并行剪切全部视频")
-                streams = detail["streams"]
-                workers = min(len(streams), state.ffmpeg_slots) or 1
-                threads_each = max(1, state.ffmpeg_slots // workers)
-                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ffmpeg") as pool:
-                    futures = {}
-                    for stream in streams:
-                        src = resolve_video(episode, stream["path"])
-                        dst = staging / stream["path"]
-                        futures[pool.submit(trim_video, src, dst, spans, detail["fps"], stream["name"], stream.get("pixelFormat", ""), threads_each)] = stream["name"]
-                    completed = 0
-                    for future in as_completed(futures):
-                        future.result()
-                        completed += 1
-                        self._update(state, 0.12 + 0.5 * completed / len(streams), f"已剪切 {futures[future]}")
+                self._update(state, 0.12, "正在保存完整源视频")
+                storage_method = materialize_video_tree(episode / "videos", staging / "videos")
+                audit.update({
+                    "formatVersion": VIRTUAL_CUT_FORMAT_VERSION,
+                    "videoMaterialization": FULL_SOURCE_VIDEO,
+                    "storageMethod": storage_method,
+                    "keptSpans": [list(item) for item in physical_kept_spans],
+                })
                 for item in episode.iterdir():
                     if item.name in {"videos", "manifest.jsonl", "CUT_INFO.json"}:
                         continue
                     target = staging / item.name
                     shutil.copytree(item, target) if item.is_dir() else shutil.copy2(item, target)
                 keep = {index for start, end in spans for index in range(start, end)}
-                written = rewrite_manifest(episode / "manifest.jsonl", staging / "manifest.jsonl", keep, detail["fps"], audit)
+                written = rewrite_manifest(
+                    episode / "manifest.jsonl", staging / "manifest.jsonl", keep,
+                    detail["fps"], audit, virtual_video=True,
+                )
                 if written != output_frames:
                     raise WorkbenchError("manifest 输出帧数不一致")
 
-            self._update(state, 0.68, "正在确认源数据状态")
+            self._update(state, 0.68, "正在复验输出")
+            output_meta = read_manifest(staging)
+            if output_meta.errors or output_meta.frame_count != output_frames:
+                raise WorkbenchError("输出 manifest 复验失败")
+            virtual_video = audit.get("videoMaterialization") == FULL_SOURCE_VIDEO
+            expected_video_frames = physical_source_frames if virtual_video else output_frames
+            for name, relative_video in output_meta.stream_paths.items():
+                output_video = resolve_video(staging, relative_video)
+                if virtual_video:
+                    source_video = resolve_video(episode, relative_video)
+                    try:
+                        video_valid = (
+                            output_video.is_file()
+                            and output_video.stat().st_size > 0
+                            and output_video.stat().st_size == source_video.stat().st_size
+                        )
+                    except OSError:
+                        video_valid = False
+                else:
+                    checked = probe_video(output_video, decoded=True)
+                    video_valid = bool(checked.get("valid")) and checked.get("frames") == expected_video_frames
+                if not video_valid:
+                    raise WorkbenchError(f"{name} 输出视频复验失败")
             current = source_token(episode, read_manifest(episode).stream_paths)
             if current != expected:
                 raise ConflictError("处理期间源数据发生变化，未发布输出")
@@ -639,7 +699,15 @@ class OperationManager:
             audit["outputFingerprint"] = output_fingerprint(staging)
             (staging / "CUT_INFO.json").write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             self._update(state, 0.84, "正在执行转换预检")
-            preflight = validate_episode(staging_root, staging, require_source=False)
+            preflight_probe = (
+                (lambda video: probe_video(video, decoded=False)) if virtual_video else None
+            )
+            preflight = validate_episode(
+                staging_root,
+                staging,
+                require_source=False,
+                video_probe=preflight_probe,
+            )
             if not preflight.valid:
                 reasons = "; ".join(preflight.reasons[:8])
                 raise WorkbenchError(f"转换预检未通过: {reasons}")
@@ -664,7 +732,7 @@ class OperationManager:
                 "operation_id": state.id, "revision": revision, "overwritten_operation_id": overwritten_id,
                 "source_root": str(root), "episode": relative, "operator": operator, "mode": mode,
                 "removed_ranges": json.dumps([list(item) for item in removed], separators=(",", ":")),
-                "source_frames": detail["frameCount"], "output_frames": output_frames,
+                "source_frames": physical_source_frames, "output_frames": output_frames,
                 "source_token": expected, "output_fingerprint": audit["outputFingerprint"],
                 "output_path": str(destination), "completed_at_utc": completed_at,
             }
