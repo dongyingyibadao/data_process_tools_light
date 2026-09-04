@@ -175,6 +175,9 @@ def test_training_features_are_three_rgb_streams_with_mode_specific_actions(tmp_
     assert converter.JOINT_NAMES[-3:] == [
         "Joint_Neck_Yaw", "Joint_Neck_Pitch", "Joint_Neck_Roll",
     ]
+    assert converter.BODY_JOINT_EEF_ACTION_NAMES[-3:] == [
+        "neck.Yaw", "neck.Pitch", "neck.Roll",
+    ]
 
 
 def test_load_source_episode_preserves_all_valid_streams_and_ignores_empty_reference(tmp_path: Path) -> None:

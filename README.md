@@ -309,7 +309,7 @@ whole_body_joint (23-D):
   left/right gripper(2), neck [Yaw, Pitch, Roll](3)
 ```
 
-普通帧使用下一状态监督：whole-body 为 `qpos[t+1]`；hybrid 的 lower body、neck 和 gripper 同样取下一帧，EEF 使用 `current_eef_pose[t] -> current_eef_pose[t+1]` 的局部增量。夹爪严格读取 `joints.position[18]` 和 `[19]`，不读取 speed/force，也不裁剪、环绕或归一化。每个 Episode 的全部 N 帧都会保留；末帧 joint/gripper/neck hold，EEF delta 为零。两套数据共同保留 38-D `observation.state`、velocity、torque、current/target EEF、height 和 source frame/timestamp 字段。neck 数值列仍是源 `[20,21,22]`，只把轴标签修正为 `Yaw, Pitch, Roll`。
+普通帧使用下一状态监督：whole-body 为 `qpos[t+1]`；hybrid 的 lower body、neck 和 gripper 同样取下一帧，EEF 使用 `current_eef_pose[t] -> current_eef_pose[t+1]` 的局部增量。夹爪严格读取 `joints.position[18]` 和 `[19]`，不读取 speed/force，也不裁剪、环绕或归一化。每个 Episode 的全部 N 帧都会保留；末帧 joint/gripper/neck hold，EEF delta 为零。两套数据共同保留 38-D `observation.state`、velocity、torque、current/target EEF、height 和 source frame/timestamp 字段。neck 数值列保持源 `[20,21,22]` 不做重排；轴标签为兼容历史训练接口继续命名为 `Yaw, Pitch, Roll`。
 
 标准训练图像 feature 严格只有：
 

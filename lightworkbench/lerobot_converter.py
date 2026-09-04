@@ -38,6 +38,7 @@ STATE_VERSION = 3
 CONVERSION_SCHEMA_VERSION = 6
 AUXILIARY_INDEX_PATH = Path("auxiliary/index.parquet")
 
+# Compatibility contract: retain the legacy YPR labels without reordering source columns.
 JOINT_NAMES = [
     "Joint_Ankle", "Joint_Knee", "Joint_Waist_Pitch", "Joint_Waist_Yaw",
     "Joint_Left_Shoulder_Inner", "Joint_Left_Shoulder_Outer",
