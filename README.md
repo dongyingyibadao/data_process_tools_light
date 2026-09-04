@@ -12,6 +12,23 @@ conda activate data_process
 
 默认地址为 `http://127.0.0.1:8332`。可通过 `HOST` 和 `PORT` 修改监听地址。页面中的 cleaned 输出根目录必须与源根目录完全分离；原始数据永不修改。
 
+## LeRobot 数据检查器
+
+服务同时提供只读的 LeRobot v3 数据检查页面：
+
+```text
+http://127.0.0.1:8332/lerobot
+```
+
+页面默认打开 `/inspire/qb-ilm/project/robot-decision/public/demo2/lerobot_data_08_29_26_cz_merged/`，也可在顶部输入其他 LeRobot dataset 或包含 dataset 的父目录。它会从 `meta/tasks.parquet` 和 `meta/episodes/` 按任务分类 Episode，并提供任务/Episode 搜索、分页、三路相机同步播放、逐帧、倍速和前后 Episode 导航。所有接口均为只读，视频按需通过 HTTP Range 请求加载，不会扫描或转码完整视频目录。
+
+该页面需要运行环境安装 `pyarrow`。使用项目依赖安装后启动即可：
+
+```bash
+python -m pip install -r requirements.txt
+HOST=0.0.0.0 PORT=8332 ./start.sh
+```
+
 ## 多人并行使用
 
 本工作台支持多人对同一批源数据中的不同 Episode 并行操作。推荐只启动一个服务，让所有人的任务进入同一个共享队列；默认并发数为 2，可同时处理两个不同的输出 Episode。

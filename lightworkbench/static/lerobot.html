@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LeRobot 数据检查器</title>
+  <link rel="stylesheet" href="assets/lerobot.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="lerobot" aria-label="LeRobot 数据检查器首页">
+      <span class="brand-mark">LR</span>
+      <span><strong>数据检查器</strong><small>LeRobot</small></span>
+    </a>
+    <label class="root-field">
+      <span>数据根目录</span>
+      <input id="rootInput" type="text" spellcheck="false" autocomplete="off"
+        value="/inspire/qb-ilm/project/robot-decision/public/demo2/lerobot_data_08_29_26_cz_merged/">
+    </label>
+    <button id="openButton" class="primary" type="button">打开</button>
+    <button id="refreshButton" class="icon-button" type="button" title="刷新数据" aria-label="刷新数据">↻</button>
+  </header>
+
+  <section class="dataset-strip" aria-label="数据集概况">
+    <div class="dataset-name">
+      <span class="status-dot" id="statusDot"></span>
+      <strong id="datasetName">尚未打开</strong>
+      <span id="datasetVersion"></span>
+    </div>
+    <dl class="summary-stats">
+      <div><dt>任务</dt><dd id="totalTasks">-</dd></div>
+      <div><dt>Episode</dt><dd id="totalEpisodes">-</dd></div>
+      <div><dt>帧</dt><dd id="totalFrames">-</dd></div>
+      <div><dt>FPS</dt><dd id="datasetFps">-</dd></div>
+    </dl>
+  </section>
+
+  <main class="workspace">
+    <aside class="task-pane pane">
+      <div class="pane-heading">
+        <div><span class="eyebrow">TASKS</span><h2>任务分类</h2></div>
+        <span id="taskCount" class="count">0</span>
+      </div>
+      <label class="search-field">
+        <span aria-hidden="true">⌕</span>
+        <input id="taskSearch" type="search" placeholder="搜索任务" autocomplete="off">
+      </label>
+      <div id="taskList" class="task-list" role="listbox" aria-label="任务列表"></div>
+      <div id="taskEmpty" class="pane-empty">输入目录并打开</div>
+    </aside>
+
+    <aside class="episode-pane pane">
+      <div class="pane-heading">
+        <div><span class="eyebrow">EPISODES</span><h2 id="episodePaneTitle">全部数据</h2></div>
+        <span id="episodeTotal" class="count">0</span>
+      </div>
+      <label class="search-field">
+        <span aria-hidden="true">⌕</span>
+        <input id="episodeSearch" type="search" placeholder="搜索 Episode" autocomplete="off">
+      </label>
+      <div id="episodeList" class="episode-list" role="listbox" aria-label="Episode 列表"></div>
+      <div id="episodeEmpty" class="pane-empty">请选择任务</div>
+      <nav id="pagination" class="pagination" aria-label="Episode 分页">
+        <button id="previousPage" class="icon-button small" type="button" title="上一页" aria-label="上一页">‹</button>
+        <span id="pageLabel">0 / 0</span>
+        <button id="nextPage" class="icon-button small" type="button" title="下一页" aria-label="下一页">›</button>
+      </nav>
+    </aside>
+
+    <section class="viewer-pane">
+      <div id="viewerWelcome" class="viewer-welcome">
+        <span class="welcome-mark">LR</span>
+        <h1>选择一个 Episode 开始检查</h1>
+        <p>任务与数据会显示在左侧列表中</p>
+      </div>
+
+      <div id="viewer" class="viewer" hidden>
+        <header class="episode-header">
+          <div class="episode-title">
+            <span class="eyebrow">CURRENT EPISODE</span>
+            <h1 id="episodeTitle">Episode</h1>
+            <p id="episodeTask">-</p>
+          </div>
+          <div class="episode-nav">
+            <button id="previousEpisode" class="secondary" type="button" title="上一个 Episode"><span aria-hidden="true">‹</span> 上一个</button>
+            <button id="nextEpisode" class="secondary" type="button" title="下一个 Episode">下一个 <span aria-hidden="true">›</span></button>
+          </div>
+        </header>
+
+        <dl class="episode-meta">
+          <div><dt>Episode</dt><dd id="metaEpisode">-</dd></div>
+          <div><dt>总帧数</dt><dd id="metaFrames">-</dd></div>
+          <div><dt>时长</dt><dd id="metaDuration">-</dd></div>
+          <div><dt>帧率</dt><dd id="metaFps">-</dd></div>
+          <div class="source-meta"><dt>数据文件</dt><dd id="metaSource">-</dd></div>
+        </dl>
+
+        <div class="video-grid" id="videoGrid">
+          <article class="video-panel" data-slot="head">
+            <header><span class="camera-dot head"></span><strong>头部相机</strong><small data-camera-name>未提供</small></header>
+            <div class="video-frame">
+              <video data-camera-video="head" preload="metadata" playsinline muted></video>
+              <div class="video-message" data-camera-message>等待 Episode</div>
+            </div>
+          </article>
+          <article class="video-panel" data-slot="left">
+            <header><span class="camera-dot left"></span><strong>左手相机</strong><small data-camera-name>未提供</small></header>
+            <div class="video-frame">
+              <video data-camera-video="left" preload="metadata" playsinline muted></video>
+              <div class="video-message" data-camera-message>等待 Episode</div>
+            </div>
+          </article>
+          <article class="video-panel" data-slot="right">
+            <header><span class="camera-dot right"></span><strong>右手相机</strong><small data-camera-name>未提供</small></header>
+            <div class="video-frame">
+              <video data-camera-video="right" preload="metadata" playsinline muted></video>
+              <div class="video-message" data-camera-message>等待 Episode</div>
+            </div>
+          </article>
+        </div>
+
+        <section class="transport" aria-label="同步视频控制">
+          <div class="transport-row">
+            <button id="stepBack" class="icon-button" type="button" title="上一帧" aria-label="上一帧">‹</button>
+            <button id="playPause" class="play-button" type="button" title="播放" aria-label="播放">▶</button>
+            <button id="stepForward" class="icon-button" type="button" title="下一帧" aria-label="下一帧">›</button>
+            <div class="clock"><strong id="currentTime">00:00.000</strong><span>/</span><span id="totalTime">00:00.000</span></div>
+            <label class="speed-field"><span>速度</span><select id="playbackRate" aria-label="播放速度"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+          </div>
+          <input id="timeline" class="timeline" type="range" min="0" max="1" step="0.001" value="0" aria-label="视频进度">
+          <div class="frame-readout"><span>当前帧</span><strong id="currentFrame">0</strong><span>/</span><span id="lastFrame">0</span></div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="assets/lerobot.js"></script>
+</body>
+</html>

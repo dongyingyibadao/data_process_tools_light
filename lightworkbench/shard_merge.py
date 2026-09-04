@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import json
 import os
 import shutil
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from .lerobot_converter import (
     AUXILIARY_INDEX_PATH,
@@ -76,22 +78,63 @@ def _load_state(root: Path) -> dict[str, Any]:
     return state
 
 
-def _validate_states(roots: Sequence[Path], states: Sequence[Mapping[str, Any]]) -> None:
+def _resolved_source_root(value: Any, root: Path) -> str:
+    if not isinstance(value, str) or not value:
+        raise StateConflictError(f"{root}: invalid source_root")
+    return str(Path(value).expanduser().resolve())
+
+
+def _entry_source_root(entry: Mapping[str, Any], state: Mapping[str, Any], root: Path) -> str:
+    return _resolved_source_root(entry.get("source_root", state.get("source_root")), root)
+
+
+def _validate_states(
+    roots: Sequence[Path],
+    states: Sequence[Mapping[str, Any]],
+    *,
+    allow_multiple_sources: bool = False,
+) -> None:
     first = states[0]
     for root, state in zip(roots[1:], states[1:], strict=True):
-        for key in ("conversion_config", "schema", "source_root"):
+        for key in ("conversion_config", "schema"):
             if state.get(key) != first.get(key):
                 raise StateConflictError(f"{root}: shard {key} differs from the first shard")
-    identities: set[str] = set()
+        if not allow_multiple_sources and _resolved_source_root(
+            state.get("source_root"), root
+        ) != _resolved_source_root(first.get("source_root"), roots[0]):
+            raise StateConflictError(f"{root}: shard source_root differs from the first shard")
+    identities: set[tuple[str, str]] = set()
     for root, state in zip(roots, states, strict=True):
         for entry in state["episodes"]:
-            identity = str(entry["source_relative_path"])
-            relative = Path(identity)
+            source_relative_path = str(entry["source_relative_path"])
+            relative = Path(source_relative_path)
             if relative.is_absolute() or ".." in relative.parts or not relative.parts:
-                raise StateConflictError(f"{root}: invalid source_relative_path {identity!r}")
+                raise StateConflictError(
+                    f"{root}: invalid source_relative_path {source_relative_path!r}"
+                )
+            identity = (_entry_source_root(entry, state, root), relative.as_posix())
             if identity in identities:
-                raise StateConflictError(f"duplicate source_relative_path across shards: {identity}")
+                raise StateConflictError(
+                    "duplicate source identity across shards: "
+                    f"source_root={identity[0]} source_relative_path={identity[1]}"
+                )
             identities.add(identity)
+
+
+def _bundle_root_for_owner(output_root: Path) -> Path:
+    return output_root.parent
+
+
+@contextmanager
+def _bundle_lock(output_root: Path) -> Iterator[None]:
+    lock_path = _bundle_root_for_owner(output_root) / ".bundle" / "convert-merged.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _read_chunk_size(staging: Path) -> int:
@@ -103,6 +146,116 @@ def _read_chunk_size(staging: Path) -> int:
     if size <= 0:
         raise StateConflictError(f"{staging}: merged LeRobot chunks_size must be positive")
     return size
+
+
+_EPISODE_CHUNK_COLUMN = "meta/episodes/chunk_index"
+_EPISODE_FILE_COLUMN = "meta/episodes/file_index"
+
+
+def _episode_metadata_files(root: Path) -> list[tuple[Path, int, int]]:
+    files: list[tuple[Path, int, int]] = []
+    for path in sorted((root / "meta/episodes").glob("chunk-*/file-*.parquet")):
+        chunk_token = path.parent.name.removeprefix("chunk-")
+        file_token = path.stem.removeprefix("file-")
+        if not chunk_token.isdigit() or not file_token.isdigit():
+            raise StateConflictError(f"{path}: invalid Episode metadata path")
+        files.append((path, int(chunk_token), int(file_token)))
+    return files
+
+
+def _normalized_episode_table(
+    runtime: Mapping[str, Any], path: Path, chunk_index: int, file_index: int,
+) -> tuple[Any, bool]:
+    try:
+        table = runtime["pq"].read_table(path)
+    except Exception as exc:
+        raise StateConflictError(f"{path}: cannot read Episode metadata: {exc}") from exc
+    changed = False
+    for column, value in (
+        (_EPISODE_CHUNK_COLUMN, chunk_index),
+        (_EPISODE_FILE_COLUMN, file_index),
+    ):
+        index = table.schema.get_field_index(column)
+        if index < 0:
+            raise StateConflictError(f"{path}: Episode metadata has no {column}")
+        if any(item != value for item in table[column].to_pylist()):
+            field = table.schema.field(index)
+            values = runtime["pa"].array([value] * table.num_rows, type=field.type)
+            table = table.set_column(index, field, values)
+            changed = True
+    return table, changed
+
+
+def _normalize_episode_metadata_in_place(runtime: Mapping[str, Any], root: Path) -> bool:
+    changed_any = False
+    for path, chunk_index, file_index in _episode_metadata_files(root):
+        table, changed = _normalized_episode_table(runtime, path, chunk_index, file_index)
+        if not changed:
+            continue
+        temporary = path.with_name(f".{path.name}.normalizing-{uuid.uuid4().hex}")
+        try:
+            runtime["pq"].write_table(table, temporary)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        changed_any = True
+    return changed_any
+
+
+def _link_tree_except(source: Path, target: Path, excluded: set[str]) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    for item in source.iterdir():
+        if item.name not in excluded:
+            (target / item.name).symlink_to(item, target_is_directory=item.is_dir())
+
+
+def _normalized_aggregation_view(
+    runtime: Mapping[str, Any], root: Path, scratch_parent: Path,
+) -> Path | None:
+    metadata_files = _episode_metadata_files(root)
+    normalized: list[tuple[Path, Any]] = []
+    for path, chunk_index, file_index in metadata_files:
+        table, changed = _normalized_episode_table(runtime, path, chunk_index, file_index)
+        if changed:
+            normalized.append((path, table))
+    if not normalized:
+        return None
+
+    tables = {path: table for path, table in normalized}
+    view = scratch_parent / f".aggregate-input-{root.name}-{uuid.uuid4().hex}"
+    try:
+        _link_tree_except(root, view, {"meta"})
+        _link_tree_except(root / "meta", view / "meta", {"episodes"})
+        for source, _chunk_index, _file_index in metadata_files:
+            target = view / source.relative_to(root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            table = tables.get(source)
+            if table is None:
+                target.symlink_to(source)
+            else:
+                runtime["pq"].write_table(table, target)
+    except Exception:
+        shutil.rmtree(view, ignore_errors=True)
+        raise
+    return view
+
+
+@contextmanager
+def _aggregation_roots(
+    runtime: Mapping[str, Any], roots: Sequence[Path], scratch_parent: Path,
+) -> Iterator[list[Path]]:
+    views: list[Path] = []
+    aggregation_roots: list[Path] = []
+    try:
+        for root in roots:
+            view = _normalized_aggregation_view(runtime, root, scratch_parent)
+            if view is not None:
+                views.append(view)
+            aggregation_roots.append(view or root)
+        yield aggregation_roots
+    finally:
+        for view in views:
+            shutil.rmtree(view, ignore_errors=True)
 
 
 def _merge_auxiliary(
@@ -162,7 +315,10 @@ def _merge_auxiliary(
             if target.exists():
                 raise StateConflictError(f"duplicate merged auxiliary target: {relative}")
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copy2(source, target)
             row["episode_index"] = global_index
             row["relative_path"] = relative.as_posix()
             rows.append(row)
@@ -177,18 +333,33 @@ def _merge_auxiliary(
     runtime["pq"].write_table(table, index_path)
 
 
-def _merged_state(states: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _merged_state(
+    roots: Sequence[Path],
+    states: Sequence[Mapping[str, Any]],
+    *,
+    preserve_created_at: bool = False,
+) -> dict[str, Any]:
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     merged = copy.deepcopy(dict(states[0]))
     episodes: list[dict[str, Any]] = []
-    for state in states:
+    source_roots: list[str] = []
+    for root, state in zip(roots, states, strict=True):
         for raw in state["episodes"]:
             entry = copy.deepcopy(dict(raw))
+            source_root = _entry_source_root(entry, state, root)
+            entry["source_root"] = source_root
             entry["lerobot_episode_index"] = len(episodes)
             episodes.append(entry)
+            if source_root not in source_roots:
+                source_roots.append(source_root)
     merged["episodes"] = episodes
     merged["stored_tasks"] = sorted({str(entry["stored_task"]) for entry in episodes})
-    merged["created_at"] = now
+    source_roots.sort()
+    merged["source_roots"] = source_roots
+    merged["source_root"] = source_roots[0]
+    merged["source_task"] = source_roots[0]
+    if not preserve_created_at:
+        merged["created_at"] = now
     merged["updated_at"] = now
     merged.pop("pending_episode", None)
     return merged
@@ -215,48 +386,62 @@ def merge_whole_body_joint_shards(
     output_root: str | Path,
     *,
     overwrite: bool = False,
+    incremental: bool = False,
 ) -> Path:
     """Merge ordered completed shards into one atomically published owner dataset.
 
     Each input may point either at a ``whole_body_joint`` directory or its bundle
-    parent. The input order defines the final global episode order.
+    parent. The input order defines the final global episode order. Incremental
+    mode uses an existing output owner as the first aggregation input.
     """
 
     if not shard_roots:
         raise ValueError("at least one shard is required")
-    roots = [_owner_root(Path(item)) for item in shard_roots]
-    if len(roots) != len(set(roots)):
-        raise ValueError("duplicate shard root")
     output_root = Path(output_root).expanduser().resolve()
-    if output_root in roots:
-        raise ValueError("output_root must not be one of the shard roots")
-    states = [_load_state(root) for root in roots]
-    _validate_states(roots, states)
-    if output_root.exists() and not overwrite:
-        raise FileExistsError(f"output already exists: {output_root}")
+    with _bundle_lock(output_root):
+        roots = [_owner_root(Path(item)) for item in shard_roots]
+        if len(roots) != len(set(roots)):
+            raise ValueError("duplicate shard root")
+        if output_root in roots:
+            raise ValueError("output_root must not be one of the shard roots")
+        if incremental:
+            if not output_root.exists():
+                raise FileNotFoundError(f"incremental output does not exist: {output_root}")
+            existing_owner = _owner_root(output_root)
+            if existing_owner != output_root:
+                raise ValueError("incremental output_root must point directly at the owner dataset")
+            roots.insert(0, existing_owner)
+        states = [_load_state(root) for root in roots]
+        _validate_states(roots, states, allow_multiple_sources=incremental)
+        if output_root.exists() and not incremental and not overwrite:
+            raise FileExistsError(f"output already exists: {output_root}")
 
-    runtime = _runtime()
-    staging = output_root.with_name(f".{output_root.name}.staging-{uuid.uuid4().hex}")
-    staging.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        runtime["aggregate_datasets"](
-            repo_ids=[str(state["repo_id"]) for state in states],
-            aggr_repo_id=str(states[0]["repo_id"]),
-            roots=roots,
-            aggr_root=staging,
-            concatenate_videos=False,
-            concatenate_data=False,
-        )
-        _merge_auxiliary(runtime, roots, states, staging)
-        state = _merged_state(states)
-        info = json.loads((staging / "meta/info.json").read_text(encoding="utf-8"))
-        if int(info.get("total_episodes", -1)) != len(state["episodes"]):
-            raise StateConflictError("official merge episode count differs from conversion state")
-        atomic_write_json(staging / CONVERSION_STATE_FILENAME, state)
-        _publish(staging, output_root, overwrite)
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging)
+        runtime = _runtime()
+        staging = output_root.with_name(f".{output_root.name}.staging-{uuid.uuid4().hex}")
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with _aggregation_roots(runtime, roots, staging.parent) as aggregation_roots:
+                runtime["aggregate_datasets"](
+                    repo_ids=[str(state["repo_id"]) for state in states],
+                    aggr_repo_id=str(states[0]["repo_id"]),
+                    roots=aggregation_roots,
+                    aggr_root=staging,
+                    concatenate_videos=False,
+                    concatenate_data=False,
+                )
+            _normalize_episode_metadata_in_place(runtime, staging)
+            _merge_auxiliary(runtime, roots, states, staging)
+            state = _merged_state(
+                roots, states, preserve_created_at=incremental,
+            )
+            info = json.loads((staging / "meta/info.json").read_text(encoding="utf-8"))
+            if int(info.get("total_episodes", -1)) != len(state["episodes"]):
+                raise StateConflictError("official merge episode count differs from conversion state")
+            atomic_write_json(staging / CONVERSION_STATE_FILENAME, state)
+            _publish(staging, output_root, overwrite or incremental)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
     return output_root
 
 

@@ -210,8 +210,123 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _normalized_relative_path(value: Any, *, context: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{context} has no source_relative_path")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        raise ValueError(f"{context} has invalid source_relative_path {value!r}")
+    return relative.as_posix()
+
+
+def _expected_owner_config(
+    *, encoder_threads: int, video_workers: int, video_encoding_mode: str,
+) -> dict[str, Any]:
+    from lightworkbench.lerobot_converter import ConverterConfig, WHOLE_BODY_JOINT
+
+    return ConverterConfig(
+        video_codec="h264",
+        video_crf=18,
+        encoder_preset="fast",
+        encoder_threads=encoder_threads,
+        encoder_queue_maxsize=30,
+        video_encoding_mode=video_encoding_mode,
+        video_workers=video_workers,
+    ).state_value(WHOLE_BODY_JOINT)
+
+
+def _schema_compatibility_key(schema: Any) -> str | None:
+    if not isinstance(schema, dict) or not isinstance(schema.get("videos"), dict):
+        return None
+    try:
+        fps = round(float(schema.get("fps") or 0), 6)
+    except (TypeError, ValueError):
+        return None
+    videos: dict[str, dict[str, Any]] = {}
+    for name, value in schema["videos"].items():
+        if not isinstance(value, dict):
+            return None
+        videos[str(name)] = {
+            "width": value.get("width"),
+            "height": value.get("height"),
+            "is_depth": bool(value.get("is_depth")),
+        }
+    return json.dumps({"fps": fps, "videos": videos}, sort_keys=True, separators=(",", ":"))
+
+
+def _filter_existing_episodes(
+    episodes: Sequence[dict[str, Any]],
+    *,
+    input_root: Path,
+    existing_owner: Path,
+    expected_config: dict[str, Any],
+    expected_schema: Any,
+) -> tuple[list[dict[str, Any]], int]:
+    resolved_owner = existing_owner.resolve()
+    direct_state = resolved_owner / "conversion_state.json"
+    bundled_state = resolved_owner / "whole_body_joint" / "conversion_state.json"
+    state_path = (
+        bundled_state
+        if bundled_state.is_file()
+        else direct_state
+    )
+    if not state_path.is_file():
+        raise ValueError(f"--existing-owner has no whole_body_joint conversion state: {state_path}")
+    state = _read_json(state_path)
+    entries = state.get("episodes")
+    if (
+        state.get("action_mode") != "whole_body_joint"
+        or state.get("dataset_layout") != "merged"
+        or not isinstance(entries, list)
+    ):
+        raise ValueError(f"{state_path}: not a merged whole_body_joint conversion state")
+    if state.get("pending_episode") is not None:
+        raise ValueError(f"{state_path}: existing owner has an uncommitted pending episode")
+    if state.get("conversion_config") != expected_config:
+        raise ValueError(f"{state_path}: conversion config is incompatible with shard run parameters")
+    report_schema_key = _schema_compatibility_key(expected_schema)
+    if report_schema_key is None or _schema_compatibility_key(state.get("schema")) != report_schema_key:
+        raise ValueError(f"{state_path}: schema is incompatible with the preflight report")
+
+    fallback_root = state.get("source_root")
+    committed: set[tuple[str, str]] = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{state_path}: episode {index} is not an object")
+        source_root = entry.get("source_root") or fallback_root
+        if not isinstance(source_root, str) or not source_root:
+            raise ValueError(f"{state_path}: episode {index} has no source_root")
+        relative = _normalized_relative_path(
+            entry.get("source_relative_path"), context=f"{state_path}: episode {index}",
+        )
+        identity = (str(Path(source_root).expanduser().resolve()), relative)
+        if identity in committed:
+            raise ValueError(f"{state_path}: duplicate committed source identity {identity!r}")
+        committed.add(identity)
+
+    resolved_input_root = str(input_root.resolve())
+    pending: list[dict[str, Any]] = []
+    excluded = 0
+    for index, episode in enumerate(episodes):
+        relative = _normalized_relative_path(
+            episode.get("source_relative_path"), context=f"preflight accepted episode {index}",
+        )
+        if (resolved_input_root, relative) in committed:
+            excluded += 1
+        else:
+            pending.append(episode)
+    return pending, excluded
+
+
 def _shard_status(
-    root: Path, selected: Sequence[str], expected_frames: int | None = None,
+    root: Path,
+    selected: Sequence[str],
+    expected_frames: int | None,
+    *,
+    source_root: Path,
+    source_signatures: Sequence[str],
+    expected_config: dict[str, Any],
+    expected_schema: Any,
 ) -> tuple[bool, dict[str, Any]]:
     report_path = root / "conversion_report.json"
     state_path = root / "whole_body_joint" / "conversion_state.json"
@@ -220,20 +335,32 @@ def _shard_status(
     report = _read_json(report_path)
     state = _read_json(state_path)
     accepted = [str(item.get("source_relative_path")) for item in report.get("accepted", [])]
+    report_signatures = [str(item.get("source_signature")) for item in report.get("accepted", [])]
     skipped = [str(item.get("source_relative_path")) for item in report.get("skipped", [])]
     failed = report.get("failed", [])
     entries = state.get("episodes", [])
     state_paths = [str(item.get("source_relative_path")) for item in entries]
+    resolved_source_root = str(source_root.resolve())
+    state_source_roots = [
+        str(Path(item.get("source_root") or state.get("source_root", "")).expanduser().resolve())
+        for item in entries
+    ]
     indices = [item.get("lerobot_episode_index") for item in entries]
     committed_frames = sum(int(item.get("output_frames") or 0) for item in entries)
     complete = (
         report.get("preflight_only") is False
         and report.get("action_mode") == "whole_body_joint"
+        and str(Path(report.get("input_root", "")).expanduser().resolve()) == resolved_source_root
         and not failed
         and accepted == list(selected)
+        and report_signatures == list(source_signatures)
         and not skipped
         and state.get("pending_episode") is None
         and state_paths == accepted
+        and state_source_roots == [resolved_source_root] * len(entries)
+        and state.get("conversion_config") == expected_config
+        and _schema_compatibility_key(state.get("schema")) == _schema_compatibility_key(expected_schema)
+        and _schema_compatibility_key(report.get("schema")) == _schema_compatibility_key(expected_schema)
         and indices == list(range(len(entries)))
         and (expected_frames is None or committed_frames == expected_frames)
     )
@@ -252,6 +379,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", type=Path, required=True, help="successful preflight conversion_report.json")
     parser.add_argument("--input-root", type=Path, required=True)
     parser.add_argument("--work-root", type=Path, required=True)
+    parser.add_argument(
+        "--existing-owner",
+        type=Path,
+        default=None,
+        help="exclude episodes already committed in this merged owner dataset",
+    )
     parser.add_argument("--shards", type=int, default=6)
     parser.add_argument(
         "--cpus", type=int, default=None,
@@ -278,17 +411,48 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = _read_json(args.report.resolve())
     if not report.get("preflight_only") or report.get("failed"):
         raise ValueError("--report must be a completed preflight report without failed episodes")
-    episodes = list(report.get("accepted", []))
-    if not episodes:
+    input_root = args.input_root.resolve()
+    report_input_root = report.get("input_root")
+    if (
+        not isinstance(report_input_root, str)
+        or Path(report_input_root).expanduser().resolve() != input_root
+    ):
+        raise ValueError("--report input_root differs from --input-root")
+    accepted = list(report.get("accepted", []))
+    if not accepted:
         raise ValueError("preflight report has no accepted episodes")
-    shards = _partition_contiguous(episodes, args.shards)
-    cpu_ids, cpu_resources = _effective_cpu_ids(args.cpus)
-    cpu_groups = _cpu_assignments(cpu_ids, args.shards, args.cpu_binding)
-    taskset = shutil.which("taskset")
-    if taskset is None:
+    if any(not isinstance(item.get("source_signature"), str) for item in accepted):
+        raise ValueError("preflight accepted episode has no source_signature")
+    expected_config = _expected_owner_config(
+        encoder_threads=args.encoder_threads,
+        video_workers=args.video_workers,
+        video_encoding_mode=args.video_encoding_mode,
+    )
+    expected_schema = report.get("schema")
+    episodes = accepted
+    excluded_existing = 0
+    existing_owner = args.existing_owner.resolve() if args.existing_owner is not None else None
+    if existing_owner is not None:
+        episodes, excluded_existing = _filter_existing_episodes(
+            accepted,
+            input_root=input_root,
+            existing_owner=existing_owner,
+            expected_config=expected_config,
+            expected_schema=expected_schema,
+        )
+        if args.shards < 1:
+            raise ValueError("shard count must be at least 1")
+        shard_count = min(args.shards, len(episodes))
+        shards = _partition_contiguous(episodes, shard_count) if shard_count else []
+    else:
+        shard_count = args.shards
+        shards = _partition_contiguous(episodes, shard_count)
+    cpu_ids, cpu_resources = _effective_cpu_ids(args.cpus if shard_count else None)
+    cpu_groups = _cpu_assignments(cpu_ids, shard_count, args.cpu_binding) if shard_count else []
+    taskset = shutil.which("taskset") if shard_count else None
+    if shard_count and taskset is None:
         raise RuntimeError("taskset is required for bounded parallel shard conversion")
 
-    input_root = args.input_root.resolve()
     work_root = args.work_root.resolve()
     work_root.mkdir(parents=True, exist_ok=True)
     plan = {
@@ -296,6 +460,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "input_root": str(input_root),
         "preflight_report": str(args.report.resolve()),
+        "existing_owner": str(existing_owner) if existing_owner is not None else None,
+        "excluded_existing": excluded_existing,
+        "pending": len(episodes),
         "cpu_resources": cpu_resources,
         "cpu_binding": args.cpu_binding,
         "encoder_threads": args.encoder_threads,
@@ -307,6 +474,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "output_root": str(work_root / f"shard-{index:02d}"),
                 "cpus": cpus,
                 "episodes": [str(item["source_relative_path"]) for item in items],
+                "source_signatures": [str(item["source_signature"]) for item in items],
                 "frames": sum(int(item["frames"]) for item in items),
             }
             for index, (items, cpus) in enumerate(zip(shards, cpu_groups, strict=True))
@@ -339,7 +507,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         index = int(item["index"])
         output_root = Path(str(item["output_root"]))
         selected = list(item["episodes"])
-        complete, status = _shard_status(output_root, selected, int(item["frames"]))
+        complete, status = _shard_status(
+            output_root,
+            selected,
+            int(item["frames"]),
+            source_root=input_root,
+            source_signatures=item["source_signatures"],
+            expected_config=expected_config,
+            expected_schema=expected_schema,
+        )
         if complete:
             results.append({
                 "index": index, "returncode": 0, "reused": True,
@@ -348,7 +524,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             })
             continue
         command = [
-            taskset,
+            str(taskset),
             "-c",
             ",".join(str(cpu) for cpu in item["cpus"]),
             args.python,
@@ -412,7 +588,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             finished_monotonic = time.monotonic()
             item["log_handle"].close()
             complete, status = _shard_status(
-                item["output_root"], item["selected"], item["frames"],
+                item["output_root"],
+                item["selected"],
+                item["frames"],
+                source_root=input_root,
+                source_signatures=plan["shards"][index]["source_signatures"],
+                expected_config=expected_config,
+                expected_schema=expected_schema,
             )
             results.append({
                 "index": index,
@@ -466,6 +648,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "encoder_threads": args.encoder_threads,
             "video_workers": args.video_workers,
             "video_encoding_mode": args.video_encoding_mode,
+            "existing_owner": str(existing_owner) if existing_owner is not None else None,
+            "excluded_existing": excluded_existing,
+            "pending": len(episodes),
             "results": results,
         },
     )

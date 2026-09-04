@@ -399,11 +399,29 @@ def test_static_no_polling() -> None:
     content = script.read_text(encoding="utf-8")
     assert "setInterval" not in content
     assert content.count("new EventSource(") == 1
-    assert 'new EventSource("/api/operations/events")' in content
+    assert 'new EventSource(appUrl("api/operations/events"))' in content
     assert "eventSources" not in content
+    assert 'localStorage.getItem("light.concurrency")' not in content
+    assert 'localStorage.setItem("light.concurrency"' not in content
     assert "new AbortController()" in content
     assert "{signal: controller.signal}" in content
     assert "Math.min(26" in content
     page = client.get("/")
     assert page.status_code == 200
     assert "episodeViewport" in page.text
+
+
+def test_static_urls_preserve_reverse_proxy_prefix() -> None:
+    static_root = Path(__file__).parents[1] / "lightworkbench" / "static"
+    index = (static_root / "index.html").read_text(encoding="utf-8")
+    lerobot = (static_root / "lerobot.html").read_text(encoding="utf-8")
+    app_script = (static_root / "app.js").read_text(encoding="utf-8")
+    lerobot_script = (static_root / "lerobot.js").read_text(encoding="utf-8")
+
+    assert 'href="/assets/' not in index + lerobot
+    assert 'src="/assets/' not in index + lerobot
+    assert 'href="/lerobot"' not in lerobot
+    assert 'fetch(appUrl(' in app_script
+    assert 'fetch(appUrl(' in lerobot_script
+    assert 'video.src = appUrl(' in app_script
+    assert 'video.src = appUrl(' in lerobot_script

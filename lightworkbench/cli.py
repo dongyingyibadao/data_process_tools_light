@@ -699,15 +699,19 @@ def _merged_conversion_reports(
     )
     ledger = getattr(result, "ledger", {})
     entries = ledger.get("episodes", []) if isinstance(ledger, dict) else []
+    active_source_root = str(ledger.get("active_source_root") or ledger.get("source_root") or "")
     statuses = {
-        str(item["source_relative_path"]): item.get("modes", {})
+        (
+            str(item.get("source_root") or ledger.get("source_root") or ""),
+            str(item["source_relative_path"]),
+        ): item.get("modes", {})
         for item in entries
         if isinstance(item, dict) and isinstance(item.get("source_relative_path"), str)
     }
     succeeded: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     for episode in episodes:
-        raw_status = statuses.get(episode.relative_path, {})
+        raw_status = statuses.get((active_source_root, episode.relative_path), {})
         mode_status = raw_status if isinstance(raw_status, dict) else {}
         report = _merged_episode_report(episode)
         report["conversion"] = {"modes": _conversion_payload(mode_status)}

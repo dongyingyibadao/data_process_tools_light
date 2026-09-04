@@ -9,6 +9,7 @@ optional conversion environment installed.
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import math
 import os
@@ -20,6 +21,7 @@ import time
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -37,6 +39,7 @@ CONVERSION_STATE_FILENAME = "conversion_state.json"
 STATE_VERSION = 3
 CONVERSION_SCHEMA_VERSION = 6
 AUXILIARY_INDEX_PATH = Path("auxiliary/index.parquet")
+MERGED_BUNDLE_LOCK_PATH = Path(".bundle/convert-merged.lock")
 
 # Compatibility contract: retain the legacy YPR labels without reordering source columns.
 JOINT_NAMES = [
@@ -644,6 +647,15 @@ def atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
             temporary.unlink()
 
 
+@contextmanager
+def merged_bundle_lock(bundle_root: Path) -> Iterable[None]:
+    lock_path = bundle_root.expanduser().resolve() / MERGED_BUNDLE_LOCK_PATH
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def _source_relative_path(episode: SourceEpisode, source_root: Path) -> str:
     try:
         relative = episode.path.resolve().relative_to(source_root.resolve())
@@ -656,17 +668,23 @@ def _source_relative_path(episode: SourceEpisode, source_root: Path) -> str:
     return relative.as_posix()
 
 
+def _normalized_source_root(source_root: str | Path) -> str:
+    return str(Path(source_root).expanduser().resolve())
+
+
 def _episode_identity(
     episode: SourceEpisode, dataset_layout: str, source_root: Path,
-) -> int | str:
+) -> int | tuple[str, str]:
     if dataset_layout == TASK_DATASET_LAYOUT:
         return episode.source_episode_id
     if dataset_layout == MERGED_DATASET_LAYOUT:
-        return _source_relative_path(episode, source_root)
+        return (_normalized_source_root(source_root), _source_relative_path(episode, source_root))
     raise ValueError(f"unsupported dataset layout: {dataset_layout}")
 
 
-def _entry_identity(entry: Mapping[str, Any], dataset_layout: str) -> int | str:
+def _entry_identity(
+    entry: Mapping[str, Any], dataset_layout: str, fallback_source_root: str | Path | None = None,
+) -> int | tuple[str, str]:
     if dataset_layout == TASK_DATASET_LAYOUT:
         return int(entry["source_episode_id"])
     relative = entry.get("source_relative_path")
@@ -675,7 +693,45 @@ def _entry_identity(entry: Mapping[str, Any], dataset_layout: str) -> int | str:
     path = Path(relative)
     if path.is_absolute() or ".." in path.parts:
         raise StateConflictError(f"invalid merged source_relative_path: {relative}")
-    return path.as_posix()
+    source_root = entry.get("source_root") or fallback_source_root
+    if not isinstance(source_root, (str, Path)) or not str(source_root):
+        raise StateConflictError(f"merged conversion state episode {relative} has no source_root")
+    return (_normalized_source_root(source_root), path.as_posix())
+
+
+def _state_source_roots(state: Mapping[str, Any]) -> list[str]:
+    values = state.get("source_roots")
+    if values is None:
+        values = [state.get("source_root")]
+    if not isinstance(values, list) or not values:
+        raise StateConflictError("merged conversion state has no source roots")
+    roots: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise StateConflictError("merged conversion state has an invalid source root")
+        normalized = _normalized_source_root(value)
+        if normalized not in roots:
+            roots.append(normalized)
+    return roots
+
+
+def _refresh_state_source_roots(state: dict[str, Any]) -> None:
+    if state.get("dataset_layout", TASK_DATASET_LAYOUT) != MERGED_DATASET_LAYOUT:
+        return
+    roots = sorted({
+        _entry_identity(entry, MERGED_DATASET_LAYOUT, state.get("source_root"))[0]
+        for entry in state.get("episodes", [])
+        if isinstance(entry, Mapping)
+    })
+    pending = state.get("pending_episode")
+    if isinstance(pending, Mapping):
+        roots.append(_entry_identity(pending, MERGED_DATASET_LAYOUT, state.get("source_root"))[0])
+        roots = sorted(set(roots))
+    if not roots:
+        roots = _state_source_roots(state)
+    state["source_roots"] = roots
+    state["source_root"] = roots[0]
+    state["source_task"] = roots[0]
 
 
 def _state_entry(
@@ -699,6 +755,7 @@ def _state_entry(
         entry.update(
             {
                 "source_relative_path": _source_relative_path(episode, source_root),
+                "source_root": _normalized_source_root(source_root),
                 "stored_task": episode.task,
             }
         )
@@ -725,6 +782,7 @@ def _append_state_episode(
     )
     state.pop("pending_episode", None)
     if dataset_layout == MERGED_DATASET_LAYOUT:
+        _refresh_state_source_roots(state)
         state["stored_tasks"] = sorted(
             {str(entry["stored_task"]) for entry in state["episodes"]}
         )
@@ -765,20 +823,28 @@ def load_conversion_state(root: Path, action_mode: str | None = None) -> dict[st
         if not isinstance(state.get("stored_task"), str) or not state["stored_task"]:
             raise StateConflictError(f"{path}: incompatible or malformed conversion state")
     else:
-        if not isinstance(state.get("source_root"), str) or not state["source_root"]:
-            raise StateConflictError(f"{path}: merged conversion state has no source_root")
+        roots = _state_source_roots(state)
+        state["source_roots"] = roots
+        state["source_root"] = roots[0]
+        state["source_task"] = roots[0]
         for entry in state["episodes"]:
             if not isinstance(entry, Mapping):
                 raise StateConflictError(f"{path}: incompatible or malformed conversion state")
+            if not entry.get("source_root"):
+                entry["source_root"] = state["source_root"]
             _entry_identity(entry, dataset_layout)
             if not isinstance(entry.get("stored_task"), str) or not entry["stored_task"]:
                 raise StateConflictError(f"{path}: merged episode has no stored task")
+        pending = state.get("pending_episode")
+        if isinstance(pending, dict) and not pending.get("source_root"):
+            pending["source_root"] = state["source_root"]
     if action_mode is not None and stored_mode != action_mode:
         raise StateConflictError(f"{path}: action mode {stored_mode} differs from requested {action_mode}")
     return state
 
 
 def _write_state(root: Path, state: dict[str, Any]) -> None:
+    _refresh_state_source_roots(state)
     state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     atomic_write_json(root / CONVERSION_STATE_FILENAME, state)
 
@@ -812,6 +878,7 @@ def new_conversion_state(
         state["stored_task"] = stored_task
     else:
         state["source_root"] = str(source_task.resolve())
+        state["source_roots"] = [str(source_task.resolve())]
         state["stored_tasks"] = []
     return state
 
@@ -835,8 +902,7 @@ def validate_incremental_state(
         raise StateConflictError("conversion state dataset layout differs from requested value")
     if state.get("conversion_config") != config.state_value(action_mode, shared_video_owner):
         raise StateConflictError("conversion settings conflict with the existing dataset")
-    source_key = "source_root" if dataset_layout == MERGED_DATASET_LAYOUT else "source_task"
-    if Path(str(state.get(source_key, ""))).resolve() != source_task.resolve():
+    if dataset_layout == TASK_DATASET_LAYOUT and Path(str(state.get("source_task", ""))).resolve() != source_task.resolve():
         raise StateConflictError("conversion state belongs to a different source directory")
     if not episodes:
         if state.get("episodes"):
@@ -851,22 +917,28 @@ def validate_incremental_state(
     if state.get("schema") != schema_for_episode(episodes[0]):
         raise StateConflictError("source video schema conflicts with the existing dataset")
 
-    by_identity: dict[int | str, SourceEpisode] = {}
+    by_identity: dict[int | tuple[str, str], SourceEpisode] = {}
     for episode in episodes:
         identity = _episode_identity(episode, dataset_layout, source_task)
         if identity in by_identity:
             label = "source episode id" if dataset_layout == TASK_DATASET_LAYOUT else "source relative path"
             raise StateConflictError(f"duplicate {label} {identity}")
         by_identity[identity] = episode
-    existing_identities: set[int | str] = set()
+    existing_identities: set[int | tuple[str, str]] = set()
     for expected_index, entry in enumerate(state.get("episodes", [])):
         if not isinstance(entry, Mapping) or entry.get("lerobot_episode_index") != expected_index:
             raise StateConflictError("conversion state episode indices are not contiguous")
-        identity = _entry_identity(entry, dataset_layout)
+        identity = _entry_identity(entry, dataset_layout, state.get("source_root"))
         if identity in existing_identities:
             raise StateConflictError(f"conversion state has duplicate source identity {identity}")
         existing_identities.add(identity)
         episode = by_identity.get(identity)
+        if (
+            dataset_layout == MERGED_DATASET_LAYOUT
+            and isinstance(identity, tuple)
+            and identity[0] != _normalized_source_root(source_task)
+        ):
+            continue
         if episode is None:
             raise StateConflictError(f"previously converted source episode {identity} is missing")
         if entry.get("source_episode_name") != episode.path.name:
@@ -1432,12 +1504,25 @@ def _encode_auxiliary_episode(
             )
         for frame_index in range(len(episode.records)):
             frame: dict[str, Any] = {"task": episode.task}
+            source_frame_ids = {
+                stream: episode.records[frame_index]["videos"][stream].get(
+                    "source_frame_id", frame_index,
+                )
+                for stream in streams
+            }
             futures = (
-                {stream: pool.submit(readers[stream].read) for stream in streams}
+                {
+                    stream: pool.submit(readers[stream].read_at, source_frame_ids[stream])
+                    for stream in streams
+                }
                 if pool is not None else None
             )
             for stream in streams:
-                image = futures[stream].result() if futures is not None else readers[stream].read()
+                image = (
+                    futures[stream].result()
+                    if futures is not None
+                    else readers[stream].read_at(source_frame_ids[stream])
+                )
                 if image is None:
                     raise RuntimeError(f"{episode.path}: auxiliary {stream} ended before frame {frame_index}")
                 video = episode.videos[stream]
@@ -1448,14 +1533,19 @@ def _encode_auxiliary_episode(
                     )
                 frame[video_key(stream)] = image
             dataset.add_frame(frame)
-        futures = (
-            {stream: pool.submit(readers[stream].read) for stream in streams}
-            if pool is not None else None
+        is_virtual = any(
+            episode.records[-1]["videos"][stream].get("source_frame_id") is not None
+            for stream in streams
         )
-        for stream, reader in readers.items():
-            extra = futures[stream].result() if futures is not None else reader.read()
-            if extra is not None:
-                raise RuntimeError(f"{episode.path}: auxiliary {stream} has frames beyond manifest")
+        if not is_virtual:
+            futures = (
+                {stream: pool.submit(readers[stream].read) for stream in streams}
+                if pool is not None else None
+            )
+            for stream, reader in readers.items():
+                extra = futures[stream].result() if futures is not None else reader.read()
+                if extra is not None:
+                    raise RuntimeError(f"{episode.path}: auxiliary {stream} has frames beyond manifest")
         dataset.save_episode(parallel_encoding=config.video_encoding_mode == "parallel")
     finally:
         if pool is not None:
@@ -1894,6 +1984,7 @@ def convert_task(
 def _replace_action_column(
     runtime: Mapping[str, Any], table: Any, episodes_by_index: Mapping[int, SourceEpisode],
     hf_features: Any,
+    existing_actions: Mapping[tuple[int, int], Sequence[float]] | None = None,
 ) -> tuple[Any, Any, list[int]]:
     pa = runtime["pa"]
     np = runtime["np"]
@@ -1901,21 +1992,42 @@ def _replace_action_column(
     frame_indices = table["source.frame_index"].to_pylist()
     actions: list[list[float]] = []
     resolved_episode_indices: list[int] = []
+    record_positions = {
+        episode_index: {
+            _record_source_frame_id(record): position
+            for position, record in enumerate(episode.records)
+        }
+        for episode_index, episode in episodes_by_index.items()
+    }
     for raw_episode_index, raw_frame_index in zip(episode_indices, frame_indices):
         episode_index = int(
             raw_episode_index[0] if isinstance(raw_episode_index, list) else raw_episode_index
         )
         frame_index = int(raw_frame_index[0] if isinstance(raw_frame_index, list) else raw_frame_index)
         episode = episodes_by_index.get(episode_index)
-        if episode is None or not 0 <= frame_index < len(episode.records):
+        if episode is None:
+            existing = (existing_actions or {}).get((episode_index, frame_index))
+            if existing is None:
+                raise StateConflictError(
+                    f"cannot derive hybrid action for episode {episode_index} frame {frame_index}"
+                )
+            resolved_episode_indices.append(episode_index)
+            actions.append([float(value) for value in existing])
+            continue
+        record_position = record_positions[episode_index].get(frame_index)
+        if record_position is None:
             raise StateConflictError(
                 f"cannot derive hybrid action for episode {episode_index} frame {frame_index}"
             )
         resolved_episode_indices.append(episode_index)
         actions.append(
             build_action(
-                episode.records[frame_index],
-                episode.records[frame_index + 1] if frame_index + 1 < len(episode.records) else None,
+                episode.records[record_position],
+                (
+                    episode.records[record_position + 1]
+                    if record_position + 1 < len(episode.records)
+                    else None
+                ),
                 action_mode=BODY_JOINT_EEF,
             )
         )
@@ -2003,8 +2115,8 @@ def _hybrid_matches_owner(
     if owner_layout == TASK_DATASET_LAYOUT:
         if state.get("stored_task") != owner_state.get("stored_task"):
             raise StateConflictError("hybrid and owner stored tasks differ")
-    elif state.get("source_root") != owner_state.get("source_root"):
-        raise StateConflictError("hybrid and owner merged source roots differ")
+    elif not set(_state_source_roots(state)).issubset(_state_source_roots(owner_state)):
+        raise StateConflictError("hybrid source roots are not a subset of the owner roots")
     owner_entries = owner_state.get("episodes")
     hybrid_entries = state.get("episodes")
     if not isinstance(owner_entries, list) or not isinstance(hybrid_entries, list):
@@ -2017,7 +2129,7 @@ def _hybrid_matches_owner(
             "source_frames", "output_frames",
         ]
         if owner_layout == MERGED_DATASET_LAYOUT:
-            keys.extend(("source_relative_path", "stored_task"))
+            keys.extend(("source_root", "source_relative_path", "stored_task"))
         for key in keys:
             if hybrid.get(key) != owner.get(key):
                 raise StateConflictError(f"hybrid and owner episode metadata differ at {key}")
@@ -2057,9 +2169,13 @@ def derive_hybrid_dataset(
         raise StateConflictError("body_joint_eef requires an existing whole_body_joint video owner")
     dataset_layout = owner_state.get("dataset_layout", TASK_DATASET_LAYOUT)
     source_root = source_task.expanduser().resolve()
-    state_source_key = "source_root" if dataset_layout == MERGED_DATASET_LAYOUT else "source_task"
-    if Path(str(owner_state.get(state_source_key, ""))).resolve() != source_root:
+    if dataset_layout == TASK_DATASET_LAYOUT and Path(str(owner_state.get("source_task", ""))).resolve() != source_root:
         raise StateConflictError("hybrid source directory differs from its video owner")
+    if (
+        dataset_layout == MERGED_DATASET_LAYOUT
+        and _normalized_source_root(source_root) not in _state_source_roots(owner_state)
+    ):
+        raise StateConflictError("hybrid source directory is not registered by its video owner")
     shared_owner = os.path.relpath(owner_root, start=hybrid_root)
     if os.path.isabs(shared_owner):
         raise StateConflictError("shared video owner must be represented by a relative path")
@@ -2071,28 +2187,26 @@ def derive_hybrid_dataset(
         indices = tuple(int(entry["lerobot_episode_index"]) for entry in existing_state["episodes"])
         return ConversionResult(hybrid_root, False, indices, (), (), (), existing_state)
 
-    by_identity: dict[int | str, SourceEpisode] = {}
+    by_identity: dict[int | tuple[str, str], SourceEpisode] = {}
     for episode in episodes:
         identity = _episode_identity(episode, dataset_layout, source_root)
         if identity in by_identity:
             raise StateConflictError(f"duplicate source identity {identity}")
         by_identity[identity] = episode
-    committed: list[SourceEpisode] = []
     episodes_by_index: dict[int, SourceEpisode] = {}
-    for entry in owner_entries:
-        identity = _entry_identity(entry, dataset_layout)
+    for entry in owner_entries[existing_count:]:
+        identity = _entry_identity(entry, dataset_layout, owner_state.get("source_root"))
         episode = by_identity.get(identity)
         if episode is None:
-            raise StateConflictError(f"owner episode {identity} is missing from source inputs")
+            raise StateConflictError(f"new owner episode {identity} is missing from source inputs")
         if entry.get("source_episode_id") != episode.source_episode_id:
             raise StateConflictError(f"owner episode {identity} changed numeric id")
         if dataset_layout == MERGED_DATASET_LAYOUT and entry.get("stored_task") != episode.task:
             raise StateConflictError(f"owner episode {identity} changed stored task")
         if source_episode_signature(episode)["digest"] != entry["source_signature"]["digest"]:
             raise StateConflictError(f"{episode.path}: source changed after owner conversion")
-        committed.append(episode)
         episodes_by_index[int(entry["lerobot_episode_index"])] = episode
-    if not committed:
+    if not owner_entries:
         raise StateConflictError("video owner has no committed episodes to derive")
 
     runtime = _heavy_runtime()
@@ -2145,8 +2259,19 @@ def derive_hybrid_dataset(
                 actions = runtime["np"].asarray(table["action"].to_pylist(), dtype=runtime["np"].float32)
                 resolved_episode_indices = [int(value) for value in table["episode_index"].to_pylist()]
             else:
+                existing_actions: dict[tuple[int, int], Sequence[float]] = {}
+                if destination.is_file():
+                    prior_table = runtime["pq"].read_table(destination)
+                    for old_episode, old_frame, old_action in zip(
+                        prior_table["episode_index"].to_pylist(),
+                        prior_table["source.frame_index"].to_pylist(),
+                        prior_table["action"].to_pylist(),
+                    ):
+                        old_episode_index = int(old_episode[0] if isinstance(old_episode, list) else old_episode)
+                        old_frame_index = int(old_frame[0] if isinstance(old_frame, list) else old_frame)
+                        existing_actions[(old_episode_index, old_frame_index)] = old_action
                 rewritten, actions, resolved_episode_indices = _replace_action_column(
-                    runtime, owner_table, episodes_by_index, hf_features,
+                    runtime, owner_table, episodes_by_index, hf_features, existing_actions,
                 )
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
@@ -2178,6 +2303,7 @@ def derive_hybrid_dataset(
         )
         state["episodes"] = [dict(entry) for entry in owner_entries]
         if dataset_layout == MERGED_DATASET_LAYOUT:
+            _refresh_state_source_roots(state)
             state["stored_tasks"] = sorted(
                 {str(entry["stored_task"]) for entry in state["episodes"]}
             )
@@ -2399,9 +2525,9 @@ def promote_aux_videos(
                 raise StateConflictError(f"hybrid consumer task differs from owner: {consumer}")
             entry_keys: tuple[str, ...] = ()
         else:
-            if consumer_state.get("source_root") != state.get("source_root"):
+            if _state_source_roots(consumer_state) != _state_source_roots(state):
                 raise StateConflictError(f"hybrid consumer source root differs from owner: {consumer}")
-            entry_keys = ("source_relative_path", "stored_task")
+            entry_keys = ("source_root", "source_relative_path", "stored_task")
         for owner_entry, consumer_entry in zip(state["episodes"], consumer_state["episodes"]):
             for key in (
                 "source_episode_id", "source_episode_name", "lerobot_episode_index",
@@ -2449,19 +2575,28 @@ def _bundle_ledger(
         raise ValueError("merged bundle ledger requires source_root")
     identity_root = source_root or bundle_root
     previous_path = _bundle_ledger_path(bundle_root, relative_task)
-    previous: dict[tuple[int | str, str], Mapping[str, Any]] = {}
+    previous: dict[tuple[int | tuple[str, str], str], Mapping[str, Any]] = {}
+    previous_entries: dict[int | tuple[str, str], dict[str, Any]] = {}
     created_at: str | None = None
     if previous_path.is_file():
         try:
             old = json.loads(previous_path.read_text(encoding="utf-8"))
             created_at = old.get("created_at") if isinstance(old.get("created_at"), str) else None
-            for entry in old.get("episodes", []):
+            old_source_root = old.get("source_root")
+            for raw_entry in old.get("episodes", []):
+                entry = dict(raw_entry)
+                if dataset_layout == MERGED_DATASET_LAYOUT and not entry.get("source_root"):
+                    entry["source_root"] = old_source_root
+                identity = _entry_identity(entry, dataset_layout, old_source_root)
+                previous_entries[identity] = entry
                 for mode, status in entry.get("modes", {}).items():
-                    previous[(_entry_identity(entry, dataset_layout), mode)] = status
+                    previous[(identity, mode)] = status
         except (OSError, ValueError, json.JSONDecodeError):
             previous = {}
+            previous_entries = {}
             created_at = None
-    committed: dict[str, dict[int | str, tuple[int, str]]] = {}
+    committed: dict[str, dict[int | tuple[str, str], tuple[int, str]]] = {}
+    canonical_entries: dict[int | tuple[str, str], dict[str, Any]] = dict(previous_entries)
     for mode, result in mode_results.items():
         indices_to_outcome = {
             **{int(index): "existing" for index in result.existing_episode_indices},
@@ -2469,16 +2604,37 @@ def _bundle_ledger(
             **{int(index): "appended" for index in result.appended_episode_indices},
         }
         committed[mode] = {
-            _entry_identity(entry, dataset_layout): (
+            _entry_identity(entry, dataset_layout, result.state.get("source_root")): (
                 int(entry["lerobot_episode_index"]),
                 indices_to_outcome.get(int(entry["lerobot_episode_index"]), "existing"),
             )
             for entry in result.state.get("episodes", [])
         }
+        for entry in result.state.get("episodes", []):
+            identity = _entry_identity(entry, dataset_layout, result.state.get("source_root"))
+            canonical_entries[identity] = dict(entry)
     errors_by_mode = {str(item.get("mode")): str(item.get("reason")) for item in errors}
-    entries: list[dict[str, Any]] = []
+    current_episodes: dict[int | tuple[str, str], SourceEpisode] = {}
     for episode in episodes:
         identity = _episode_identity(episode, dataset_layout, identity_root)
+        current_episodes[identity] = episode
+        if identity not in canonical_entries:
+            canonical_entries[identity] = _state_entry(
+                episode,
+                len(canonical_entries),
+                dataset_layout=dataset_layout,
+                source_root=identity_root,
+            )
+
+    def order(item: tuple[int | tuple[str, str], dict[str, Any]]) -> tuple[int, str]:
+        identity, entry = item
+        raw_index = entry.get("lerobot_episode_index")
+        if isinstance(raw_index, int):
+            return raw_index, str(identity)
+        return len(canonical_entries), str(identity)
+
+    entries: list[dict[str, Any]] = []
+    for identity, source_entry in sorted(canonical_entries.items(), key=order):
         modes: dict[str, Any] = {}
         for mode in ACTION_MODES:
             old_status = previous.get((identity, mode), {})
@@ -2493,20 +2649,28 @@ def _bundle_ledger(
                 outcome = "existing"
             else:
                 outcome = "pending"
+            attempted = identity in current_episodes and (
+                mode in mode_results or mode in errors_by_mode
+            )
             modes[mode] = {
                 "status": "committed" if is_committed else "pending",
-                "attempts": int(old_status.get("attempts", 0)) + (1 if mode in mode_results or mode in errors_by_mode else 0),
+                "attempts": int(old_status.get("attempts", 0)) + (1 if attempted else 0),
                 "last_error": None if is_committed else errors_by_mode.get(mode, old_status.get("last_error")),
                 "outcome": outcome,
             }
         entry = {
-            "source_episode_name": episode.path.name,
-            "source_episode_id": episode.source_episode_id,
-            "source_signature": source_episode_signature(episode),
-            "modes": modes,
+            key: source_entry[key]
+            for key in ("source_episode_name", "source_episode_id", "source_signature")
+            if key in source_entry
         }
+        entry["modes"] = modes
         if dataset_layout == MERGED_DATASET_LAYOUT:
-            entry.update({"source_relative_path": str(identity), "stored_task": episode.task})
+            assert isinstance(identity, tuple)
+            entry.update({
+                "source_root": identity[0],
+                "source_relative_path": identity[1],
+                "stored_task": str(source_entry.get("stored_task") or current_episodes[identity].task),
+            })
         entries.append(entry)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     ledger = {
@@ -2523,8 +2687,11 @@ def _bundle_ledger(
         ledger["relative_task"] = relative_task.as_posix()
     else:
         assert source_root is not None
-        ledger["source_root"] = str(source_root.resolve())
-        ledger["stored_tasks"] = sorted({episode.task for episode in episodes})
+        roots = sorted({str(entry["source_root"]) for entry in entries})
+        ledger["source_root"] = roots[0] if roots else str(source_root.resolve())
+        ledger["source_roots"] = roots or [str(source_root.resolve())]
+        ledger["active_source_root"] = str(source_root.resolve())
+        ledger["stored_tasks"] = sorted({str(entry["stored_task"]) for entry in entries})
     return ledger
 
 
@@ -2604,7 +2771,7 @@ def convert_task_bundle(
     return BundleConversionResult(bundle_root, action_mode, results, ledger, tuple(errors))
 
 
-def convert_merged_bundle(
+def _convert_merged_bundle_unlocked(
     episodes: Sequence[SourceEpisode],
     bundle_root: Path,
     namespace: str,
@@ -2613,8 +2780,6 @@ def convert_merged_bundle(
     action_mode: str = "both",
     config: ConverterConfig | None = None,
 ) -> BundleConversionResult:
-    """Create or incrementally append one cross-task dual-action bundle."""
-
     if action_mode not in {"both", *ACTION_MODES}:
         raise ValueError(f"unsupported action mode: {action_mode}")
     config = config or ConverterConfig()
@@ -2702,6 +2867,29 @@ def convert_merged_bundle(
     )
     atomic_write_json(_bundle_ledger_path(bundle_root, None), ledger)
     return BundleConversionResult(bundle_root, action_mode, results, ledger, tuple(errors))
+
+
+def convert_merged_bundle(
+    episodes: Sequence[SourceEpisode],
+    bundle_root: Path,
+    namespace: str,
+    *,
+    source_root: Path,
+    action_mode: str = "both",
+    config: ConverterConfig | None = None,
+) -> BundleConversionResult:
+    """Create or incrementally append one cross-task dual-action bundle."""
+
+    resolved_bundle = bundle_root.expanduser().resolve()
+    with merged_bundle_lock(resolved_bundle):
+        return _convert_merged_bundle_unlocked(
+            episodes,
+            resolved_bundle,
+            namespace,
+            source_root=source_root,
+            action_mode=action_mode,
+            config=config,
+        )
 
 
 __all__ = [

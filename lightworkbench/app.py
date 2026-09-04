@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .config import RESOURCES, STATIC_ROOT
 from .core import BrowseService, EpisodeService, WorkbenchError
+from .lerobot_browser import DEFAULT_LEROBOT_ROOT, LerobotBrowserService
 from .operations import OperationManager
 
 
@@ -38,6 +39,7 @@ app = FastAPI(title="极简高性能剪切工作台", version="1.0.0")
 browse_service = BrowseService()
 episode_service = EpisodeService()
 operation_manager = OperationManager(episode_service)
+lerobot_browser = LerobotBrowserService()
 SSE_POLL_SECONDS = 0.2
 SSE_KEEPALIVE_SECONDS = 15.0
 
@@ -75,6 +77,45 @@ async def validation_error(_: Request, exc: RequestValidationError) -> JSONRespo
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {"status": "ok", "resources": RESOURCES}
+
+
+@app.get("/api/lerobot/summary")
+def lerobot_summary(root: str = str(DEFAULT_LEROBOT_ROOT)) -> dict[str, Any]:
+    return lerobot_browser.summary(root)
+
+
+@app.get("/api/lerobot/episodes")
+def lerobot_episodes(
+    root: str = str(DEFAULT_LEROBOT_ROOT),
+    task_index: int | None = None,
+    q: str = "",
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=48, ge=1, le=200),
+) -> dict[str, Any]:
+    return lerobot_browser.episodes(
+        root,
+        task_index=task_index,
+        query=q,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/api/lerobot/episodes/{episode_index}/media/{stream_key}")
+def lerobot_media(episode_index: int, stream_key: str, root: str = str(DEFAULT_LEROBOT_ROOT)) -> FileResponse:
+    path = lerobot_browser.media(episode_index, stream_key, root)
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=None,
+        content_disposition_type="inline",
+        headers={"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"},
+    )
+
+
+@app.get("/api/lerobot/episodes/{episode_index}")
+def lerobot_episode_detail(episode_index: int, root: str = str(DEFAULT_LEROBOT_ROOT)) -> dict[str, Any]:
+    return lerobot_browser.detail(episode_index, root)
 
 
 @app.get("/api/browse")
@@ -184,3 +225,8 @@ app.mount("/assets", StaticFiles(directory=STATIC_ROOT), name="assets")
 @app.get("/", include_in_schema=False)
 def index() -> FileResponse:
     return FileResponse(STATIC_ROOT / "index.html")
+
+
+@app.get("/lerobot", include_in_schema=False)
+def lerobot_index() -> FileResponse:
+    return FileResponse(STATIC_ROOT / "lerobot.html")

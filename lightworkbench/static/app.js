@@ -9,6 +9,13 @@ const state = {
   notifiedTerminal: new Set(), episodeController: null,
 };
 const rowHeight = 48;
+const appBaseUrl = new URL(".", window.location.href);
+
+function appUrl(path) {
+  const value = String(path);
+  if (/^(?:[a-z][a-z\d+.-]*:)?\/\//i.test(value)) return value;
+  return new URL(value.replace(/^\/+/, ""), appBaseUrl).toString();
+}
 
 const sourceRoot = $("#sourceRoot");
 const outputRoot = $("#outputRoot");
@@ -27,7 +34,7 @@ function toast(message) {
 }
 
 async function api(url, options = {}) {
-  const response = await fetch(url, options);
+  const response = await fetch(appUrl(url), options);
   let payload = null;
   try { payload = await response.json(); } catch (_) { payload = {}; }
   if (!response.ok) {
@@ -263,7 +270,7 @@ function setStream(stream) {
   const frame = state.frame;
   const resumePreview = state.preview && state.nextKeptFrame !== null;
   localStorage.setItem("light.camera", stream.name);
-  video.src = stream.mediaUrl;
+  video.src = appUrl(stream.mediaUrl);
   video.load();
   video.addEventListener("loadedmetadata", () => {
     seekFrame(frame);
@@ -656,7 +663,7 @@ function applyOperationsSnapshot(data) {
 
 function followOperations() {
   if (state.operationEvents) return;
-  const source = new EventSource("/api/operations/events");
+  const source = new EventSource(appUrl("api/operations/events"));
   state.operationEvents = source;
   source.addEventListener("snapshot", (event) => applyOperationsSnapshot(JSON.parse(event.data)));
 }
@@ -683,15 +690,7 @@ async function loadOperations() {
 
 async function loadSettings() {
   try {
-    let data = await api("/api/operations/settings");
-    const remembered = Number(localStorage.getItem("light.concurrency"));
-    if (Number.isInteger(remembered) && remembered >= 1 && remembered <= 4 && remembered !== data.concurrency) {
-      data = await api("/api/operations/settings", {
-        method: "PATCH",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({concurrency: remembered}),
-      });
-    }
+    const data = await api("/api/operations/settings");
     $("#concurrency").value = String(data.concurrency);
   } catch (error) {
     toast(error.message);
@@ -706,7 +705,6 @@ $("#concurrency").addEventListener("change", async (event) => {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({concurrency}),
     });
-    localStorage.setItem("light.concurrency", String(data.concurrency));
     event.target.value = String(data.concurrency);
   } catch (error) {
     toast(error.message);
